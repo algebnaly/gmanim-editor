@@ -1,0 +1,9 @@
+/target
+/Cargo.lock
+/*.png
+/*.mp4
+/*.typst
+/*.svg
+/*.log
+/temp
+/__pycache__

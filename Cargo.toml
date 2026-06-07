@@ -1,0 +1,16 @@
+[package]
+name = "gmanim-editor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.34.3"
+egui = "0.34.3"
+gmanim-core = { version = "0.1.0", path = "../gmanim" }
+gmanim-python-binding = { version = "0.1.0", path = "../gmanim-python-binding", default-features = false }
+nalgebra = "0.35.0"
+notify = "6.1.1"
+pyo3 = { version = "0.28.3", features = ["auto-initialize"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
