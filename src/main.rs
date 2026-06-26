@@ -44,6 +44,9 @@ struct GmanimEditorApp {
     python_script: String,
     execution_result: String,
     current_timeline: Option<gmanim_core::animation::Timeline>,
+    rendered_frames: Vec<std::sync::Arc<egui::ColorImage>>,
+    is_rendering: bool,
+    total_frames_to_render: u32,
     texture_handle: Option<egui::TextureHandle>,
     has_project: bool,
     is_playing: bool,
@@ -116,6 +119,9 @@ impl GmanimEditorApp {
             execution_result: String::new(),
             current_timeline: None,
             texture_handle: None,
+            rendered_frames: Vec::new(),
+            is_rendering: false,
+            total_frames_to_render: 0,
             has_project,
             is_playing: true,
             current_time: 0.0,
@@ -135,26 +141,7 @@ impl GmanimEditorApp {
     }
 
     fn seek_to(&mut self, target_time: f32) {
-        if target_time < self.current_time {
-            self.run_python(); // Resets current_time to 0.0
-        }
-        
-        let target_frame = (target_time * 60.0) as u32;
-        let mut current_frame = (self.current_time * 60.0) as u32;
-        
-        if let Some(timeline) = &mut self.current_timeline {
-            let mut changed = false;
-            while current_frame < target_frame {
-                timeline.advance_frame();
-                current_frame += 1;
-                changed = true;
-            }
-            if changed {
-                timeline.render_current_state();
-            }
-        }
         self.current_time = target_time;
-        self.texture_handle = None;
     }
 
     fn run_python(&mut self) {
@@ -262,9 +249,12 @@ for mod_name, mod in list(sys.modules.items()):
                     self.selected_scene = self.available_scenes.first().cloned().unwrap_or_default();
                 }
                 
+                self.total_frames_to_render = timeline.total_frames();
                 self.current_timeline = Some(timeline);
                 self.texture_handle = None; // clear texture to force re-render
                 self.current_time = 0.0;
+                self.rendered_frames.clear();
+                self.is_rendering = true;
                 self.execution_result = "Execution successful".to_owned();
             }
             Ok((scenes, None)) => {
@@ -275,6 +265,9 @@ for mod_name, mod in list(sys.modules.items()):
 
                 self.current_timeline = None;
                 self.texture_handle = None;
+                self.rendered_frames.clear();
+                self.is_rendering = false;
+                self.total_frames_to_render = 0;
                 self.execution_result = "Execution completed, but no Scene object found".to_owned();
             }
             Err(e) => {
@@ -385,7 +378,7 @@ impl eframe::App for GmanimEditorApp {
         egui::Panel::bottom("bottom_panel").show_inside(root_ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    let max_frames = self.current_timeline.as_ref().map(|t| t.total_frames()).unwrap_or(0);
+                    let max_frames = self.total_frames_to_render;
                     let max_time = max_frames as f32 / 60.0;
                     
                     if ui.button("⏮").on_hover_text("Restart").clicked() {
@@ -427,7 +420,7 @@ impl eframe::App for GmanimEditorApp {
                 ui.horizontal(|ui| {
                     ui.label("Timeline:");
                     let mut new_time = self.current_time;
-                    let max_frames = self.current_timeline.as_ref().map(|t| t.total_frames()).unwrap_or(0);
+                    let max_frames = self.total_frames_to_render;
                     let max_time = max_frames as f32 / 60.0;
 
                     if ui.add(egui::Slider::new(&mut new_time, 0.0..=(max_time.max(0.1))).text("s")).changed() {
@@ -449,7 +442,7 @@ impl eframe::App for GmanimEditorApp {
 
             let mut need_seek = None;
             if self.is_playing {
-                let max_time = self.current_timeline.as_ref().map(|t| t.total_frames()).unwrap_or(0) as f32 / 60.0;
+                let max_time = self.total_frames_to_render as f32 / 60.0;
                 let delta = (1.0 / 60.0) * self.playback_speed;
                 let mut new_time = self.current_time + delta;
                 
@@ -474,22 +467,56 @@ impl eframe::App for GmanimEditorApp {
             if let Some(time) = need_seek {
                 self.seek_to(time);
                 ui.ctx().request_repaint();
-            } else if self.texture_handle.is_none() {
+            }
+            
+            if self.is_rendering {
                 if let Some(timeline) = &mut self.current_timeline {
-                    // Render first frame if missing
-                    timeline.render_current_state();
+                    // Render frames incrementally to avoid freezing UI
+                    for _ in 0..2 {
+                        if timeline.step_frame() {
+                            let w = timeline.ctx.scene_config.output_width as usize;
+                            let h = timeline.ctx.scene_config.output_height as usize;
+                            let raw_bytes = timeline.image_bytes();
+                            let image = if let Some(bytes) = raw_bytes {
+                                if bytes.len() == 0 {
+                                    egui::ColorImage::from_rgba_unmultiplied([w, h], &vec![0u8; w * h * 4])
+                                } else {
+                                    egui::ColorImage::from_rgba_unmultiplied([w, h], bytes)
+                                }
+                            } else {
+                                egui::ColorImage::from_rgba_unmultiplied([w, h], &vec![0u8; w * h * 4])
+                            };
+                            self.rendered_frames.push(std::sync::Arc::new(image));
+                        } else {
+                            self.is_rendering = false;
+                            break;
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                } else {
+                    self.is_rendering = false;
                 }
             }
+            
+            if self.is_rendering {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Rendering: {} / {}", self.rendered_frames.len(), self.total_frames_to_render));
+                });
+            }
 
-            if let Some(timeline) = &mut self.current_timeline {
-                if self.texture_handle.is_none() {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [
-                            timeline.ctx.scene_config.output_width as usize,
-                            timeline.ctx.scene_config.output_height as usize,
-                        ],
-                        timeline.ctx.image_bytes(),
-                    );
+
+            let current_frame_idx = (self.current_time * 60.0) as usize;
+            let image_to_show = if let Some(img) = self.rendered_frames.get(current_frame_idx) {
+                Some(img.clone())
+            } else {
+                self.rendered_frames.last().cloned()
+            };
+            
+            if let Some(image) = image_to_show {
+                if let Some(tex) = &mut self.texture_handle {
+                    tex.set(image, egui::TextureOptions::LINEAR);
+                } else {
                     let texture = ui.ctx().load_texture("preview", image, egui::TextureOptions::LINEAR);
                     self.texture_handle = Some(texture);
                 }
