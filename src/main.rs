@@ -274,7 +274,7 @@ impl GmanimEditorApp {
             ".venv/bin/python"
         };
 
-        let child = match std::process::Command::new(python_exe)
+        let mut child = match std::process::Command::new(python_exe)
             .arg("-m")
             .arg("gmanim.editor_runner")
             .arg(&self.current_file)
@@ -282,6 +282,8 @@ impl GmanimEditorApp {
             .arg(&shm_id)
             .arg("--ctrl-socket")
             .arg(&ctrl_socket_name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -290,6 +292,49 @@ impl GmanimEditorApp {
                 return;
             }
         };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ipc_rx = Some(rx);
+
+        if let Some(mut stderr) = child.stderr.take() {
+            let tx_err = tx.clone();
+            let ctx_err = ctx.clone();
+            let handle_err = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = stderr.read_to_string(&mut s);
+                if !s.trim().is_empty() {
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("editor.log")
+                        .unwrap_or_else(|_| std::fs::File::create("editor.log").unwrap());
+                    use std::io::Write;
+                    let _ = file.write_all(s.as_bytes());
+                    let _ = tx_err.send(crate::ipc::ThreadMessage::Error(s));
+                    ctx_err.request_repaint();
+                }
+            });
+            self.ipc_threads.push(handle_err);
+        }
+
+        if let Some(mut stdout) = child.stdout.take() {
+            let handle_out = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = stdout.read_to_string(&mut s);
+                if !s.trim().is_empty() {
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("editor.log")
+                        .unwrap_or_else(|_| std::fs::File::create("editor.log").unwrap());
+                    use std::io::Write;
+                    let _ = file.write_all(s.as_bytes());
+                }
+            });
+            self.ipc_threads.push(handle_out);
+        }
 
         self.subprocess = Some(child);
         self.execution_result = "Running script...".to_owned();
@@ -301,9 +346,6 @@ impl GmanimEditorApp {
         self.rendered_count = 0;
         self.is_rendering = false;
         self.total_frames_to_render = 0;
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.ipc_rx = Some(rx);
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<EditorCommand>();
         self.ipc_tx_cmd = Some(cmd_tx);
