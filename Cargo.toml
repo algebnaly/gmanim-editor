@@ -10,6 +10,7 @@ gmanim-core = { version = "0.1.0", path = "../gmanim" }
 gmanim-python-binding = { version = "0.1.0", path = "../gmanim-python-binding", default-features = false }
 nalgebra = "0.35.0"
 notify = "6.1.1"
+pollster = "0.4.0"
 pyo3 = { version = "0.28.3", features = ["auto-initialize"] }
 
 [dev-dependencies]
