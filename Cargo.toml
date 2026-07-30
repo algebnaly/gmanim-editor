@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = "0.34.3"
 egui = "0.34.3"
+gmanim-editor-protocol = { path = "protocol" }
 interprocess = "2.4.2"
 nalgebra = "0.35.0"
 notify = "6.1.1"

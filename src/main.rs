@@ -3,19 +3,310 @@ use interprocess::TryClone;
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions, prelude::*, traits::Listener,
 };
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::Ordering;
 
 pub mod ipc;
-use ipc::{EditorCommand, EditorEvent, ShmHeader, ThreadMessage};
+use ipc::{
+    EditorCommand, EditorEvent, PREVIEW_SLOT_COUNT, PreviewLayout, PreviewPixelFormat,
+    PreviewShmHeader, ThreadMessage,
+};
 
-struct SendShmem(shared_memory::Shmem);
-unsafe impl Send for SendShmem {}
-unsafe impl Sync for SendShmem {}
-impl SendShmem {
-    fn as_ptr(&self) -> *mut u8 {
-        self.0.as_ptr()
+const PREVIEW_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+const PREVIEW_CACHE_MIN_FRAMES: usize = PREVIEW_SLOT_COUNT as usize;
+const PREVIEW_CACHE_MAX_FRAMES: usize = 256;
+const PREVIEW_BUFFER_LOW_WATER: usize = 32;
+const PREVIEW_BUFFER_HIGH_WATER: usize = 48;
+const PREVIEW_COMPLETIONS_PER_UI_UPDATE: usize = 4;
+
+fn producer_state(active: bool, buffered: usize, low_water: usize, high_water: usize) -> bool {
+    if active {
+        buffered < high_water
+    } else {
+        buffered < low_water
     }
+}
+
+fn buffered_producer_state(
+    active: bool,
+    primed: bool,
+    buffered: usize,
+    low_water: usize,
+    high_water: usize,
+) -> (bool, bool) {
+    let primed = primed || buffered >= high_water;
+    let active = if primed {
+        buffered < high_water
+    } else {
+        producer_state(active, buffered, low_water, high_water)
+    };
+    (active, primed)
+}
+
+fn advance_playback_time(
+    current_time: f32,
+    delta: f32,
+    total_frames: u32,
+    framerate: u32,
+    looping: bool,
+) -> (f32, bool) {
+    if total_frames == 0 || framerate == 0 {
+        return (current_time, true);
+    }
+    let next_time = current_time + delta;
+    if looping {
+        let duration = total_frames as f32 / framerate as f32;
+        return (next_time.rem_euclid(duration), true);
+    }
+    let last_frame_time = total_frames.saturating_sub(1) as f32 / framerate as f32;
+    if next_time >= last_frame_time {
+        (last_frame_time, false)
+    } else if next_time <= 0.0 {
+        (0.0, false)
+    } else {
+        (next_time, true)
+    }
+}
+
+fn directional_window(
+    desired: u32,
+    total_frames: u32,
+    forward: bool,
+    looping: bool,
+    limit: usize,
+) -> Vec<u32> {
+    if total_frames == 0 {
+        return Vec::new();
+    }
+    let mut frames = Vec::with_capacity(limit.min(total_frames as usize));
+    let mut seen = HashSet::with_capacity(limit.min(total_frames as usize));
+    for offset in 0..limit as u32 {
+        let frame = if forward {
+            match desired.checked_add(offset) {
+                Some(frame) if frame < total_frames => Some(frame),
+                Some(frame) if looping => Some(frame % total_frames),
+                _ => None,
+            }
+        } else if offset <= desired {
+            Some(desired - offset)
+        } else if looping {
+            let wrapped = (offset - desired) % total_frames;
+            Some((total_frames - wrapped) % total_frames)
+        } else {
+            None
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        if !seen.insert(frame) {
+            break;
+        }
+        frames.push(frame);
+    }
+    frames
+}
+
+struct RateMeter {
+    window_started: std::time::Instant,
+    samples: u32,
+    rate: f32,
+}
+
+impl RateMeter {
+    fn new() -> Self {
+        Self {
+            window_started: std::time::Instant::now(),
+            samples: 0,
+            rate: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn sample(&mut self) {
+        self.samples += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(500) {
+            self.rate = self.samples as f32 / elapsed.as_secs_f32();
+            self.window_started = std::time::Instant::now();
+            self.samples = 0;
+        }
+    }
+
+    fn rate(&self) -> f32 {
+        if self.samples == 0 && self.window_started.elapsed() >= std::time::Duration::from_secs(1) {
+            0.0
+        } else {
+            self.rate
+        }
+    }
+}
+
+struct PreviewFrameCache {
+    frames: HashMap<u32, std::sync::Arc<egui::ColorImage>>,
+    lru: VecDeque<u32>,
+    capacity: usize,
+}
+
+impl PreviewFrameCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            frames: HashMap::new(),
+            lru: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn contains(&self, frame: u32) -> bool {
+        self.frames.contains_key(&frame)
+    }
+
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn closest_not_after(&self, frame: u32) -> Option<u32> {
+        self.frames
+            .keys()
+            .copied()
+            .filter(|cached| *cached <= frame)
+            .max()
+    }
+
+    fn closest_not_before(&self, frame: u32) -> Option<u32> {
+        self.frames
+            .keys()
+            .copied()
+            .filter(|cached| *cached >= frame)
+            .min()
+    }
+
+    fn playback_frame(
+        &self,
+        desired: u32,
+        displayed: Option<u32>,
+        forward: bool,
+        looping: bool,
+    ) -> Option<u32> {
+        let candidate = if forward {
+            self.closest_not_after(desired)
+        } else {
+            self.closest_not_before(desired)
+        }?;
+        let Some(displayed) = displayed else {
+            return Some(candidate);
+        };
+        let crossed_loop_boundary =
+            looping && ((forward && desired < displayed) || (!forward && desired > displayed));
+        if crossed_loop_boundary
+            || (forward && candidate >= displayed)
+            || (!forward && candidate <= displayed)
+        {
+            Some(candidate)
+        } else if self.contains(displayed) {
+            Some(displayed)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, frame: u32, image: std::sync::Arc<egui::ColorImage>) {
+        if self.frames.insert(frame, image).is_none() {
+            self.lru.push_back(frame);
+        }
+        self.touch(frame);
+        while self.frames.len() > self.capacity {
+            if let Some(evicted) = self.lru.pop_front() {
+                self.frames.remove(&evicted);
+            }
+        }
+    }
+
+    fn load_image(&mut self, frame: u32) -> Option<std::sync::Arc<egui::ColorImage>> {
+        if !self.frames.contains_key(&frame) {
+            return None;
+        }
+        self.touch(frame);
+        self.frames.get(&frame).cloned()
+    }
+
+    fn touch(&mut self, frame: u32) {
+        self.lru.retain(|cached| *cached != frame);
+        self.lru.push_back(frame);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreviewRequest {
+    id: u64,
+    frame: u32,
+    slot: u32,
+}
+
+#[derive(Clone)]
+struct PreviewReadbackConfig {
+    shm_id: String,
+    layout: PreviewLayout,
+}
+
+fn read_preview_image(
+    shmem: &shared_memory::Shmem,
+    layout: PreviewLayout,
+    request_id: u64,
+    frame: u32,
+    slot: u32,
+) -> Result<std::sync::Arc<egui::ColorImage>, String> {
+    let header = unsafe { &*(shmem.as_ptr() as *const PreviewShmHeader) };
+    if header.published(slot) != Some((request_id, frame)) {
+        return Err("preview publication does not match the completed request".to_owned());
+    }
+    if header.layout().map_err(|error| error.to_string())? != layout {
+        return Err("preview shared-memory layout changed unexpectedly".to_owned());
+    }
+    let width = layout.width as usize;
+    let height = layout.height as usize;
+    let packed_stride = width * 4;
+    let source = unsafe { shmem.as_ptr().add(layout.frame_offset(u64::from(slot))) };
+    let opaque = (0..height).all(|row| {
+        let source_row = unsafe {
+            std::slice::from_raw_parts(source.add(row * layout.stride as usize), packed_stride)
+        };
+        source_row.chunks_exact(4).all(|pixel| pixel[3] == 255)
+    });
+    let mut pixels = vec![egui::Color32::TRANSPARENT; width * height];
+    if opaque {
+        debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
+        for row in 0..height {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.add(row * layout.stride as usize),
+                    pixels.as_mut_ptr().cast::<u8>().add(row * packed_stride),
+                    packed_stride,
+                );
+            }
+        }
+    } else {
+        for row in 0..height {
+            let source_row = unsafe {
+                std::slice::from_raw_parts(source.add(row * layout.stride as usize), packed_stride)
+            };
+            for (column, pixel) in source_row.chunks_exact(4).enumerate() {
+                pixels[row * width + column] =
+                    egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+        }
+    }
+    Ok(std::sync::Arc::new(egui::ColorImage::new(
+        [width, height],
+        pixels,
+    )))
 }
 
 fn main() -> eframe::Result<()> {
@@ -61,20 +352,37 @@ struct GmanimEditorApp {
     run_counter: u32,
     keep_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ipc_threads: Vec<std::thread::JoinHandle<()>>,
+    ipc_event_tx: Option<std::sync::mpsc::Sender<ThreadMessage>>,
 
-    rendered_frames: Vec<Option<std::sync::Arc<egui::ColorImage>>>,
-    rendered_count: u32,
-    is_rendering: bool,
+    preview_shmem: Option<shared_memory::Shmem>,
+    preview_readback_config: std::sync::Arc<std::sync::Mutex<Option<PreviewReadbackConfig>>>,
+    preview_cache: Option<PreviewFrameCache>,
+    preview_ready: bool,
+    displayed_frame: Option<u32>,
+    desired_frame: u32,
+    in_flight_requests: HashMap<u64, PreviewRequest>,
+    free_preview_slots: VecDeque<u32>,
+    next_request_id: u64,
+    prefetch_queue: VecDeque<u32>,
+    producer_active: bool,
+    preview_buffer_primed: bool,
+    render_failed: bool,
     total_frames_to_render: u32,
     texture_handle: Option<egui::TextureHandle>,
     has_project: bool,
     is_playing: bool,
     current_time: f32,
+    preview_framerate: u32,
+    preview_size: (u32, u32),
     available_scenes: Vec<String>,
     selected_scene: String,
     _watcher: Option<notify::RecommendedWatcher>,
     file_changed_rx: std::sync::mpsc::Receiver<()>,
-    playback_speed: f32,
+    pending_file_reload: Option<std::time::Instant>,
+    time_scale: f32,
+    render_rate: RateMeter,
+    display_rate: RateMeter,
+    skipped_timeline_frames: u64,
     is_looping: bool,
     show_editor: bool,
 }
@@ -170,20 +478,37 @@ impl GmanimEditorApp {
             run_counter: 0,
             keep_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ipc_threads: Vec::new(),
+            ipc_event_tx: None,
 
             texture_handle: None,
-            rendered_frames: Vec::new(),
-            rendered_count: 0,
-            is_rendering: false,
+            preview_shmem: None,
+            preview_readback_config: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            preview_cache: None,
+            preview_ready: false,
+            displayed_frame: None,
+            desired_frame: 0,
+            in_flight_requests: HashMap::new(),
+            free_preview_slots: (0..PREVIEW_SLOT_COUNT).collect(),
+            next_request_id: 1,
+            prefetch_queue: VecDeque::new(),
+            producer_active: false,
+            preview_buffer_primed: false,
+            render_failed: false,
             total_frames_to_render: 0,
             has_project,
             is_playing: true,
             current_time: 0.0,
+            preview_framerate: 60,
+            preview_size: (16, 9),
             available_scenes: Vec::new(),
             selected_scene: String::new(),
             _watcher: watcher,
             file_changed_rx: rx,
-            playback_speed: 1.0,
+            pending_file_reload: None,
+            time_scale: 1.0,
+            render_rate: RateMeter::new(),
+            display_rate: RateMeter::new(),
+            skipped_timeline_frames: 0,
             is_looping: true,
             show_editor: true,
         };
@@ -217,31 +542,12 @@ impl GmanimEditorApp {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let shm_id = format!("gmanim_shm_{}_{}", std::process::id(), timestamp);
 
         let ctrl_socket_name = if cfg!(windows) {
             format!(r"\\.\pipe\gmanim_ctrl_{}_{}", std::process::id(), timestamp)
         } else {
             format!("/tmp/gmanim_ctrl_{}_{}", std::process::id(), timestamp)
         };
-
-        // Create Shared Memory with 16-frame Ring Buffer
-        let created_shm = match shared_memory::ShmemConf::new()
-            .size(1920 * 1080 * 4 * 16 + std::mem::size_of::<ShmHeader>())
-            .os_id(&shm_id)
-            .create()
-        {
-            Ok(s) => s,
-            Err(e) => {
-                self.execution_result = format!("Failed to create SHM: {}", e);
-                return;
-            }
-        };
-
-        let header = unsafe { &mut *(created_shm.as_ptr() as *mut ShmHeader) };
-        header.is_rendering.store(false, Ordering::Release);
-        header.write_idx.store(0, Ordering::Release);
-        header.read_idx.store(0, Ordering::Release);
 
         // Remove old UDS file on Unix
         if !cfg!(windows) {
@@ -278,8 +584,6 @@ impl GmanimEditorApp {
             .arg("-m")
             .arg("gmanim.editor_runner")
             .arg(&self.current_file)
-            .arg("--shm-id")
-            .arg(&shm_id)
             .arg("--ctrl-socket")
             .arg(&ctrl_socket_name)
             .stdout(std::process::Stdio::piped())
@@ -295,6 +599,7 @@ impl GmanimEditorApp {
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.ipc_rx = Some(rx);
+        self.ipc_event_tx = Some(tx.clone());
 
         if let Some(mut stderr) = child.stderr.take() {
             let tx_err = tx.clone();
@@ -341,16 +646,29 @@ impl GmanimEditorApp {
 
         // Clear view
         self.texture_handle = None;
+        self.displayed_frame = None;
         self.current_time = 0.0;
-        self.rendered_frames.clear();
-        self.rendered_count = 0;
-        self.is_rendering = false;
+        self.preview_shmem = None;
+        *self.preview_readback_config.lock().unwrap() = None;
+        self.preview_cache = None;
+        self.preview_ready = false;
+        self.desired_frame = 0;
+        self.in_flight_requests.clear();
+        self.free_preview_slots = (0..PREVIEW_SLOT_COUNT).collect();
+        self.prefetch_queue.clear();
+        self.producer_active = false;
+        self.preview_buffer_primed = false;
+        self.render_rate.reset();
+        self.display_rate.reset();
+        self.skipped_timeline_frames = 0;
+        self.render_failed = false;
         self.total_frames_to_render = 0;
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<EditorCommand>();
         self.ipc_tx_cmd = Some(cmd_tx);
 
         let ctx_clone = ctx.clone();
+        let preview_readback_config = self.preview_readback_config.clone();
 
         let tx_listen = tx.clone();
         let keep_running_listen = self.keep_running.clone();
@@ -383,6 +701,8 @@ impl GmanimEditorApp {
             let keep_running_read = keep_running_listen.clone();
             let _handle2 = std::thread::spawn(move || {
                 let mut line = String::new();
+                let mut preview_readback: Option<(String, shared_memory::Shmem, PreviewLayout)> =
+                    None;
                 while keep_running_read.load(Ordering::Acquire) {
                     match reader.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
@@ -392,17 +712,65 @@ impl GmanimEditorApp {
                                     EditorEvent::ScenesInfo { scenes } => {
                                         let _ = tx_clone.send(ThreadMessage::ScenesInfo(scenes));
                                     }
-                                    EditorEvent::StartRender {
+                                    EditorEvent::SceneReady {
                                         total_frames,
-                                        width: _,
-                                        height: _,
+                                        width,
+                                        height,
+                                        framerate,
                                     } => {
-                                        let _ = tx_clone.send(ThreadMessage::StartRender {
+                                        let _ = tx_clone.send(ThreadMessage::SceneReady {
                                             total_frames: total_frames as u32,
+                                            width,
+                                            height,
+                                            framerate,
                                         });
                                     }
-                                    EditorEvent::FinishRender => {
-                                        let _ = tx_clone.send(ThreadMessage::FinishRender);
+                                    EditorEvent::PreviewOpened => {
+                                        let _ = tx_clone.send(ThreadMessage::PreviewOpened);
+                                    }
+                                    EditorEvent::FrameReady {
+                                        request_id,
+                                        frame,
+                                        slot,
+                                    } => {
+                                        let config =
+                                            preview_readback_config.lock().unwrap().clone();
+                                        let result = config
+                                            .ok_or_else(|| {
+                                                "preview readback is not configured".to_owned()
+                                            })
+                                            .and_then(|config| {
+                                                let needs_open = preview_readback
+                                                    .as_ref()
+                                                    .is_none_or(|(id, _, _)| *id != config.shm_id);
+                                                if needs_open {
+                                                    let shmem = shared_memory::ShmemConf::new()
+                                                        .os_id(&config.shm_id)
+                                                        .open()
+                                                        .map_err(|error| error.to_string())?;
+                                                    preview_readback =
+                                                        Some((config.shm_id, shmem, config.layout));
+                                                }
+                                                let (_, shmem, layout) =
+                                                    preview_readback.as_ref().unwrap();
+                                                read_preview_image(
+                                                    shmem, *layout, request_id, frame, slot,
+                                                )
+                                            });
+                                        match result {
+                                            Ok(image) => {
+                                                let _ = tx_clone.send(ThreadMessage::FrameReady {
+                                                    request_id,
+                                                    frame,
+                                                    slot,
+                                                    image,
+                                                });
+                                            }
+                                            Err(message) => {
+                                                let _ =
+                                                    tx_clone.send(ThreadMessage::Error(message));
+                                            }
+                                        }
                                     }
                                     EditorEvent::Error { message } => {
                                         let _ = tx_clone.send(ThreadMessage::Error(message));
@@ -432,58 +800,255 @@ impl GmanimEditorApp {
             // we don't strictly need to join handle2 here, but we could.
         });
 
-        // Background thread to poll SHM during rendering
-        let tx_shm = tx.clone();
-        let ctx_shm = ctx.clone();
-        let send_shmem = SendShmem(created_shm);
-        let keep_running_shm = self.keep_running.clone();
-        let handle3 = std::thread::spawn(move || {
-            loop {
-                if !keep_running_shm.load(Ordering::Acquire) {
-                    break;
-                }
+        self.ipc_threads.push(handle1);
+    }
 
-                let header = unsafe { &*(send_shmem.as_ptr() as *const ShmHeader) };
-                let is_rendering = header.is_rendering.load(Ordering::Acquire);
-                let write_idx = header.write_idx.load(Ordering::Acquire);
-                let mut read_idx = header.read_idx.load(Ordering::Acquire);
+    fn prepare_preview(
+        &mut self,
+        total_frames: u32,
+        width: u32,
+        height: u32,
+        framerate: u32,
+    ) -> Result<(), String> {
+        let layout = PreviewLayout::packed_rgba(width, height, PREVIEW_SLOT_COUNT)
+            .map_err(|error| error.to_string())?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let shm_id = format!(
+            "gmanim_preview_{}_{}_{}",
+            std::process::id(),
+            self.run_counter,
+            timestamp
+        );
+        let shmem = shared_memory::ShmemConf::new()
+            .size(layout.total_size)
+            .os_id(&shm_id)
+            .create()
+            .map_err(|error| format!("failed to create preview shared memory: {error}"))?;
+        let header = PreviewShmHeader::new(
+            width,
+            height,
+            layout.capacity,
+            PreviewPixelFormat::Rgba8Unorm,
+        )
+        .map_err(|error| error.to_string())?;
+        unsafe {
+            std::ptr::write(shmem.as_ptr() as *mut PreviewShmHeader, header);
+        }
 
-                if write_idx > read_idx {
-                    let width = header.width as usize;
-                    let height = header.height as usize;
-                    let size = width * height * 4;
-                    let base_pixels_ptr =
-                        unsafe { send_shmem.as_ptr().add(std::mem::size_of::<ShmHeader>()) };
+        self.preview_shmem = Some(shmem);
+        *self.preview_readback_config.lock().unwrap() = Some(PreviewReadbackConfig {
+            shm_id: shm_id.clone(),
+            layout,
+        });
+        let frame_bytes = width as usize * height as usize * 4;
+        let cache_capacity = (PREVIEW_CACHE_BUDGET_BYTES / frame_bytes.max(1))
+            .clamp(PREVIEW_CACHE_MIN_FRAMES, PREVIEW_CACHE_MAX_FRAMES);
+        self.preview_cache = Some(PreviewFrameCache::new(cache_capacity));
+        self.preview_ready = false;
+        self.displayed_frame = None;
+        self.texture_handle = None;
+        self.total_frames_to_render = total_frames;
+        self.preview_framerate = framerate.max(1);
+        self.preview_size = (width, height);
+        self.current_time = 0.0;
+        self.desired_frame = 0;
+        self.in_flight_requests.clear();
+        self.free_preview_slots = (0..PREVIEW_SLOT_COUNT).collect();
+        self.prefetch_queue.clear();
+        self.producer_active = false;
+        self.preview_buffer_primed = false;
+        self.render_failed = false;
+        self.execution_result = "Preparing preview...".to_owned();
 
-                    while read_idx < write_idx {
-                        let buf_idx = (read_idx % 16) as usize;
-                        let pixels_ptr = unsafe { base_pixels_ptr.add(buf_idx * size) };
+        self.ipc_tx_cmd
+            .as_ref()
+            .ok_or_else(|| "editor command channel is unavailable".to_owned())?
+            .send(EditorCommand::OpenPreview { shm_id })
+            .map_err(|_| "Python renderer stopped before opening the preview".to_owned())?;
+        self.preview_ready = true;
+        self.set_preview_target(0);
+        Ok(())
+    }
 
-                        let mut buf = vec![0u8; size];
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(pixels_ptr, buf.as_mut_ptr(), size);
-                        }
+    fn accept_preview_frame(
+        &mut self,
+        request_id: u64,
+        frame: u32,
+        slot: u32,
+        image: std::sync::Arc<egui::ColorImage>,
+    ) -> Result<(), String> {
+        self.in_flight_requests
+            .get(&request_id)
+            .copied()
+            .filter(|request| request.frame == frame && request.slot == slot)
+            .ok_or_else(|| "preview completion does not match the in-flight request".to_owned())?;
+        self.preview_cache
+            .as_mut()
+            .ok_or_else(|| "preview cache is unavailable".to_owned())?
+            .insert(frame, image);
+        self.render_rate.sample();
+        self.in_flight_requests.remove(&request_id);
+        self.free_preview_slots.push_back(slot);
+        self.execution_result = format!("Frame {frame} ready");
+        Ok(())
+    }
 
-                        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &buf);
-                        let _ = tx_shm.send(ThreadMessage::FrameReady(
-                            read_idx,
-                            std::sync::Arc::new(image),
-                        ));
+    fn set_preview_target(&mut self, frame: u32) {
+        let frame = frame.min(self.total_frames_to_render.saturating_sub(1));
+        if frame != self.desired_frame {
+            let crossed_loop_boundary = self.is_looping
+                && ((self.time_scale > 0.0 && frame < self.desired_frame)
+                    || (self.time_scale < 0.0 && frame > self.desired_frame));
+            if self.is_playing && !crossed_loop_boundary {
+                self.skipped_timeline_frames +=
+                    u64::from(frame.abs_diff(self.desired_frame).saturating_sub(1));
+            }
+            self.desired_frame = frame;
+        }
+        self.refill_preview_buffer();
+        self.dispatch_preview_requests();
+    }
 
-                        read_idx += 1;
-                        header.read_idx.store(read_idx, Ordering::Release);
+    fn playback_window(&self, limit: usize) -> Vec<u32> {
+        directional_window(
+            self.desired_frame,
+            self.total_frames_to_render,
+            self.time_scale >= 0.0,
+            self.is_looping,
+            limit,
+        )
+    }
+
+    fn refill_preview_buffer(&mut self) {
+        let Some(cache) = self.preview_cache.as_ref() else {
+            return;
+        };
+        let in_flight_frames: HashSet<u32> = self
+            .in_flight_requests
+            .values()
+            .map(|request| request.frame)
+            .collect();
+
+        if !self.is_playing {
+            self.producer_active = false;
+            self.prefetch_queue.clear();
+            for distance in 0..=PREVIEW_BUFFER_LOW_WATER {
+                for candidate in [
+                    self.desired_frame.checked_add(distance as u32),
+                    self.desired_frame.checked_sub(distance as u32),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if candidate < self.total_frames_to_render
+                        && !cache.contains(candidate)
+                        && !in_flight_frames.contains(&candidate)
+                        && !self.prefetch_queue.contains(&candidate)
+                    {
+                        self.prefetch_queue.push_back(candidate);
                     }
-                    ctx_shm.request_repaint();
-                } else if !is_rendering {
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                } else {
-                    std::thread::yield_now();
                 }
             }
-        });
+            return;
+        }
 
-        self.ipc_threads.push(handle1);
-        self.ipc_threads.push(handle3);
+        let window = self.playback_window(PREVIEW_BUFFER_HIGH_WATER);
+        let buffered = window
+            .iter()
+            .take_while(|frame| cache.contains(**frame) || in_flight_frames.contains(*frame))
+            .count();
+        let effective_high_water = window.len();
+        let effective_low_water = PREVIEW_BUFFER_LOW_WATER.min(effective_high_water);
+        let was_active = self.producer_active;
+        (self.producer_active, self.preview_buffer_primed) = buffered_producer_state(
+            self.producer_active,
+            self.preview_buffer_primed,
+            buffered,
+            effective_low_water,
+            effective_high_water,
+        );
+        if was_active && !self.producer_active && !self.preview_buffer_primed {
+            self.prefetch_queue.clear();
+            return;
+        }
+
+        self.prefetch_queue = window
+            .into_iter()
+            .filter(|frame| {
+                !cache.contains(*frame)
+                    && !in_flight_frames.contains(frame)
+                    && (self.producer_active || *frame == self.desired_frame)
+            })
+            .collect();
+    }
+
+    fn preview_buffer_status(&self) -> (usize, usize) {
+        let Some(cache) = self.preview_cache.as_ref() else {
+            return (0, 0);
+        };
+        let in_flight_frames: HashSet<u32> = self
+            .in_flight_requests
+            .values()
+            .map(|request| request.frame)
+            .collect();
+        let window = self.playback_window(PREVIEW_BUFFER_HIGH_WATER);
+        let buffered = window
+            .iter()
+            .take_while(|frame| cache.contains(**frame) || in_flight_frames.contains(*frame))
+            .count();
+        (buffered, window.len())
+    }
+
+    fn dispatch_preview_requests(&mut self) {
+        if !self.preview_ready || self.total_frames_to_render == 0 {
+            return;
+        }
+        while let Some(slot) = self.free_preview_slots.pop_front() {
+            let Some(frame) = self.prefetch_queue.pop_front() else {
+                self.free_preview_slots.push_front(slot);
+                break;
+            };
+            let cached = self
+                .preview_cache
+                .as_ref()
+                .is_some_and(|cache| cache.contains(frame));
+            let pending = self
+                .in_flight_requests
+                .values()
+                .any(|request| request.frame == frame);
+            if cached || pending {
+                self.free_preview_slots.push_front(slot);
+                continue;
+            }
+            let request_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+            let Some(tx) = &self.ipc_tx_cmd else {
+                self.free_preview_slots.push_front(slot);
+                return;
+            };
+            if tx
+                .send(EditorCommand::RenderFrame {
+                    request_id,
+                    frame,
+                    slot,
+                })
+                .is_err()
+            {
+                self.free_preview_slots.push_front(slot);
+                return;
+            }
+            self.in_flight_requests.insert(
+                request_id,
+                PreviewRequest {
+                    id: request_id,
+                    frame,
+                    slot,
+                },
+            );
+        }
     }
 }
 
@@ -517,8 +1082,16 @@ impl eframe::App for GmanimEditorApp {
         let ctx = &root_ui.ctx().clone();
 
         // Check file change
-        if let Ok(_) = self.file_changed_rx.try_recv() {
-            while let Ok(_) = self.file_changed_rx.try_recv() {}
+        if self.file_changed_rx.try_recv().is_ok() {
+            while self.file_changed_rx.try_recv().is_ok() {}
+            self.pending_file_reload = Some(std::time::Instant::now());
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self
+            .pending_file_reload
+            .is_some_and(|changed_at| changed_at.elapsed() >= std::time::Duration::from_millis(250))
+        {
+            self.pending_file_reload = None;
             let mut new_available_files = Vec::new();
             if let Ok(entries) = std::fs::read_dir(".") {
                 for entry in entries.flatten() {
@@ -543,44 +1116,65 @@ impl eframe::App for GmanimEditorApp {
         }
 
         // Process IPC messages
-        if let Some(rx) = &self.ipc_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    ThreadMessage::ScenesInfo(scenes) => {
-                        self.available_scenes = scenes;
-                        if !self.available_scenes.contains(&self.selected_scene) {
-                            self.selected_scene =
-                                self.available_scenes.first().cloned().unwrap_or_default();
-                        }
-                        if let Some(tx) = &self.ipc_tx_cmd {
-                            let _ = tx.send(EditorCommand::RenderScene {
-                                name: self.selected_scene.clone(),
-                            });
-                        }
+        let mut ipc_messages = Vec::new();
+        if let Some(rx) = self.ipc_rx.as_ref() {
+            for _ in 0..PREVIEW_COMPLETIONS_PER_UI_UPDATE {
+                let Ok(message) = rx.try_recv() else {
+                    break;
+                };
+                ipc_messages.push(message);
+            }
+            if ipc_messages.len() == PREVIEW_COMPLETIONS_PER_UI_UPDATE {
+                ctx.request_repaint();
+            }
+        }
+        for message in ipc_messages {
+            match message {
+                ThreadMessage::ScenesInfo(scenes) => {
+                    self.available_scenes = scenes;
+                    if !self.available_scenes.contains(&self.selected_scene) {
+                        self.selected_scene =
+                            self.available_scenes.first().cloned().unwrap_or_default();
                     }
-                    ThreadMessage::StartRender { total_frames } => {
-                        self.total_frames_to_render = total_frames;
-                        self.is_rendering = true;
-                        self.rendered_frames = vec![None; total_frames as usize];
-                        self.rendered_count = 0;
-                        self.execution_result = "Rendering...".to_owned();
+                    if let Some(tx) = &self.ipc_tx_cmd {
+                        let _ = tx.send(EditorCommand::LoadScene {
+                            name: self.selected_scene.clone(),
+                        });
                     }
-                    ThreadMessage::FrameReady(idx, img) => {
-                        if (idx as usize) < self.rendered_frames.len() {
-                            if self.rendered_frames[idx as usize].is_none() {
-                                self.rendered_count += 1;
-                            }
-                            self.rendered_frames[idx as usize] = Some(img);
-                        }
+                }
+                ThreadMessage::SceneReady {
+                    total_frames,
+                    width,
+                    height,
+                    framerate,
+                } => {
+                    if let Err(error) = self.prepare_preview(total_frames, width, height, framerate)
+                    {
+                        self.render_failed = true;
+                        self.execution_result = format!("Error: {error}");
                     }
-                    ThreadMessage::FinishRender => {
-                        self.is_rendering = false;
-                        self.execution_result = "Execution successful".to_owned();
+                }
+                ThreadMessage::PreviewOpened => {
+                    self.preview_ready = true;
+                    self.execution_result = "Preview ready".to_owned();
+                    self.set_preview_target(0);
+                }
+                ThreadMessage::FrameReady {
+                    request_id,
+                    frame,
+                    slot,
+                    image,
+                } => {
+                    if let Err(error) = self.accept_preview_frame(request_id, frame, slot, image) {
+                        self.render_failed = true;
+                        self.execution_result = format!("Error: {error}");
                     }
-                    ThreadMessage::Error(msg) => {
-                        self.is_rendering = false;
-                        self.execution_result = format!("Error: {}", msg);
-                    }
+                    self.set_preview_target(self.desired_frame);
+                    ctx.request_repaint();
+                }
+                ThreadMessage::Error(msg) => {
+                    self.render_failed = true;
+                    self.execution_result = format!("Error: {}", msg);
                 }
             }
         }
@@ -649,7 +1243,7 @@ impl eframe::App for GmanimEditorApp {
                 if self.selected_scene != previous_scene && !self.selected_scene.is_empty() {
                     // Start rendering new scene
                     if let Some(tx) = &self.ipc_tx_cmd {
-                        let _ = tx.send(EditorCommand::RenderScene {
+                        let _ = tx.send(EditorCommand::LoadScene {
                             name: self.selected_scene.clone(),
                         });
                         self.current_time = 0.0;
@@ -696,53 +1290,55 @@ impl eframe::App for GmanimEditorApp {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let max_frames = self.total_frames_to_render;
-                    let max_time = max_frames as f32 / 60.0;
+                    let max_time =
+                        max_frames.saturating_sub(1) as f32 / self.preview_framerate as f32;
 
                     if ui.button("⏮").on_hover_text("Restart").clicked() {
                         self.seek_to(0.0);
                     }
                     if ui.button("⏪").on_hover_text("Rewind 2x").clicked() {
-                        self.playback_speed = -2.0;
+                        self.time_scale = -2.0;
                         self.is_playing = true;
                     }
                     if ui.button("◀").on_hover_text("Play Backward").clicked() {
-                        self.playback_speed = -1.0;
+                        self.time_scale = -1.0;
                         self.is_playing = true;
                     }
 
-                    let play_text = if self.is_playing && self.playback_speed == 1.0 {
+                    let play_text = if self.is_playing && self.time_scale == 1.0 {
                         "⏸"
                     } else {
                         "▶"
                     };
                     if ui.button(play_text).on_hover_text("Play / Pause").clicked() {
-                        if self.is_playing && self.playback_speed == 1.0 {
+                        if self.is_playing && self.time_scale == 1.0 {
                             self.is_playing = false;
                         } else {
                             if self.current_time >= max_time {
                                 self.seek_to(0.0);
                             }
-                            self.playback_speed = 1.0;
+                            self.time_scale = 1.0;
                             self.is_playing = true;
                         }
                     }
 
                     if ui.button("⏩").on_hover_text("Fast Forward 2x").clicked() {
-                        self.playback_speed = 2.0;
+                        self.time_scale = 2.0;
                         self.is_playing = true;
                     }
 
                     ui.checkbox(&mut self.is_looping, "🔁 Loop");
 
-                    ui.label("Speed:");
-                    ui.add(egui::DragValue::new(&mut self.playback_speed).speed(0.1));
+                    ui.label("Time scale:");
+                    ui.add(egui::DragValue::new(&mut self.time_scale).speed(0.1));
                 });
 
                 ui.horizontal(|ui| {
                     ui.label("Timeline:");
                     let mut new_time = self.current_time;
                     let max_frames = self.total_frames_to_render;
-                    let max_time = max_frames as f32 / 60.0;
+                    let max_time =
+                        max_frames.saturating_sub(1) as f32 / self.preview_framerate as f32;
 
                     if ui
                         .add(egui::Slider::new(&mut new_time, 0.0..=(max_time.max(0.1))).text("s"))
@@ -760,42 +1356,66 @@ impl eframe::App for GmanimEditorApp {
             ui.heading("Preview");
             ui.separator();
 
+            let status_height = 24.0;
+            let (buffered_frames, buffer_target) = self.preview_buffer_status();
+            let (cache_len, cache_capacity) = self
+                .preview_cache
+                .as_ref()
+                .map(|cache| (cache.len(), cache.capacity()))
+                .unwrap_or_default();
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), status_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if let Some(request) = self.in_flight_requests.values().next() {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Rendering {} frames (next {})",
+                            self.in_flight_requests.len(),
+                            request.frame
+                        ));
+                    } else if self.preview_ready {
+                        ui.label("Ready");
+                    } else {
+                        ui.label("Preparing preview");
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Scene {} | Display {:.1} | Render {:.1} FPS | Buffer {}/{} | Cache {}/{} | {} | {:.2}x | skipped {}",
+                        self.preview_framerate,
+                        self.display_rate.rate(),
+                        self.render_rate.rate(),
+                        buffered_frames,
+                        buffer_target,
+                        cache_len,
+                        cache_capacity,
+                        if self.producer_active {
+                            if self.preview_buffer_primed { "maintaining" } else { "filling" }
+                        } else {
+                            "idle"
+                        },
+                        self.time_scale,
+                        self.skipped_timeline_frames
+                    ));
+                },
+            );
+
             let available_size = ui.available_size();
             let width = available_size.x.max(1.0) as u32;
             let height = available_size.y.max(1.0) as u32;
 
             let mut need_seek = None;
-            if self.is_playing {
-                let max_time = self.total_frames_to_render as f32 / 60.0;
-                let rendered_max_time = if self.is_rendering {
-                    (self.rendered_count.saturating_sub(1) as f32).max(0.0) / 60.0
-                } else {
-                    max_time
-                };
-
+            if self.is_playing && self.total_frames_to_render > 0 {
                 let dt = ui.input(|i| i.stable_dt);
-                let delta = dt * self.playback_speed;
-                let mut new_time = self.current_time + delta;
-
-                if self.playback_speed > 0.0 && new_time >= rendered_max_time {
-                    if self.is_rendering {
-                        new_time = rendered_max_time;
-                    } else if new_time >= max_time {
-                        if self.is_looping {
-                            new_time = 0.0;
-                        } else {
-                            new_time = max_time;
-                            self.is_playing = false;
-                        }
-                    }
-                } else if self.playback_speed < 0.0 && new_time < 0.0 {
-                    if self.is_looping {
-                        new_time = rendered_max_time;
-                    } else {
-                        new_time = 0.0;
-                        self.is_playing = false;
-                    }
-                }
+                let delta = dt * self.time_scale;
+                let (new_time, keep_playing) = advance_playback_time(
+                    self.current_time,
+                    delta,
+                    self.total_frames_to_render,
+                    self.preview_framerate,
+                    self.is_looping,
+                );
+                self.is_playing = keep_playing;
                 need_seek = Some(new_time);
             }
 
@@ -804,49 +1424,48 @@ impl eframe::App for GmanimEditorApp {
                 ui.ctx().request_repaint();
             }
 
-            if self.is_rendering {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!(
-                        "Rendering: {} / {}",
-                        self.rendered_count, self.total_frames_to_render
-                    ));
-                });
-            }
-
-            let current_frame_idx = (self.current_time * 60.0) as usize;
-            let mut image_to_show = None;
-            if !self.rendered_frames.is_empty() {
-                let max_idx = current_frame_idx.min(self.rendered_frames.len().saturating_sub(1));
-                for i in (0..=max_idx).rev() {
-                    if let Some(Some(img)) = self.rendered_frames.get(i) {
-                        image_to_show = Some(img.clone());
-                        break;
-                    }
-                }
-                if image_to_show.is_none() {
-                    for i in (current_frame_idx + 1)..self.rendered_frames.len() {
-                        if let Some(Some(img)) = self.rendered_frames.get(i) {
-                            image_to_show = Some(img.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if let Some(image) = image_to_show {
-                if let Some(tex) = &mut self.texture_handle {
-                    tex.set(image, egui::TextureOptions::LINEAR);
+            let current_frame = ((self.current_time * self.preview_framerate as f32) as u32)
+                .min(self.total_frames_to_render.saturating_sub(1));
+            self.set_preview_target(current_frame);
+            let frame_to_display = self.preview_cache.as_ref().and_then(|cache| {
+                if cache.contains(current_frame) {
+                    Some(current_frame)
+                } else if self.is_playing {
+                    cache.playback_frame(
+                        current_frame,
+                        self.displayed_frame,
+                        self.time_scale >= 0.0,
+                        self.is_looping,
+                    )
                 } else {
-                    let texture =
-                        ui.ctx()
-                            .load_texture("preview", image, egui::TextureOptions::LINEAR);
-                    self.texture_handle = Some(texture);
+                    None
                 }
+            });
+            if self.displayed_frame != frame_to_display
+                && let Some(frame) = frame_to_display
+                && let Some(image) = self
+                    .preview_cache
+                    .as_mut()
+                    .and_then(|cache| cache.load_image(frame))
+            {
+                if let Some(texture) = &mut self.texture_handle {
+                    texture.set(egui::ImageData::Color(image), egui::TextureOptions::LINEAR);
+                } else {
+                    self.texture_handle = Some(ui.ctx().load_texture(
+                        "preview",
+                        egui::ImageData::Color(image),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                self.displayed_frame = Some(frame);
+                self.display_rate.sample();
+            }
+            if frame_to_display.is_none() {
+                ui.ctx().request_repaint();
             }
 
             if let Some(tex) = &self.texture_handle {
-                let aspect_ratio = 16.0 / 9.0;
+                let aspect_ratio = self.preview_size.0 as f32 / self.preview_size.1 as f32;
                 let mut display_width = width as f32;
                 let mut display_height = width as f32 / aspect_ratio;
 
@@ -865,5 +1484,99 @@ impl eframe::App for GmanimEditorApp {
                 ui.label("No scene loaded.");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PreviewFrameCache, advance_playback_time, buffered_producer_state, directional_window,
+        producer_state,
+    };
+
+    #[test]
+    fn preview_cache_evicts_the_least_recently_used_frame() {
+        let mut cache = PreviewFrameCache::new(2);
+        let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [2, 1],
+            &[255, 0, 0, 255, 0, 255, 0, 128],
+        ));
+        cache.insert(1, image.clone());
+        cache.insert(2, image.clone());
+        cache.load_image(1).unwrap();
+        cache.insert(3, image);
+
+        assert!(cache.contains(1));
+        assert!(!cache.contains(2));
+        assert!(cache.contains(3));
+        let image = cache.load_image(1).unwrap();
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels[0].to_srgba_unmultiplied(), [255, 0, 0, 255]);
+        assert_eq!(image.pixels[1].to_srgba_unmultiplied(), [0, 255, 0, 128]);
+    }
+
+    #[test]
+    fn producer_uses_low_and_high_water_hysteresis() {
+        assert!(!producer_state(false, 32, 32, 48));
+        assert!(producer_state(false, 31, 32, 48));
+        assert!(producer_state(true, 47, 32, 48));
+        assert!(!producer_state(true, 48, 32, 48));
+    }
+
+    #[test]
+    fn primed_buffer_is_maintained_without_waiting_for_low_water() {
+        assert_eq!(
+            buffered_producer_state(true, false, 48, 32, 48),
+            (false, true)
+        );
+        assert_eq!(
+            buffered_producer_state(false, true, 47, 32, 48),
+            (true, true)
+        );
+        assert_eq!(
+            buffered_producer_state(true, true, 48, 32, 48),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn looping_preserves_forward_and_backward_overshoot() {
+        let (forward, playing) = advance_playback_time(9.99, 0.02, 1200, 120, true);
+        assert!(playing);
+        assert!((forward - 0.01).abs() < 1e-4);
+
+        let (backward, playing) = advance_playback_time(0.01, -0.02, 1200, 120, true);
+        assert!(playing);
+        assert!((backward - 9.99).abs() < 1e-4);
+    }
+
+    #[test]
+    fn missing_timeline_does_not_cancel_playback_intent() {
+        assert_eq!(advance_playback_time(0.0, 0.01, 0, 120, true), (0.0, true));
+    }
+
+    #[test]
+    fn playback_selection_never_regresses_outside_a_loop_boundary() {
+        let mut cache = PreviewFrameCache::new(8);
+        for frame in [84, 100, 103, 1199, 0] {
+            cache.insert(
+                frame,
+                std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                    [1, 1],
+                    &[0, 0, 0, 255],
+                )),
+            );
+        }
+
+        assert_eq!(cache.playback_frame(102, Some(100), true, true), Some(100));
+        assert_eq!(cache.playback_frame(0, Some(1199), true, true), Some(0));
+        assert_eq!(cache.playback_frame(101, Some(103), false, true), Some(103));
+    }
+
+    #[test]
+    fn directional_window_uses_effective_end_and_deduplicates_short_loops() {
+        assert_eq!(directional_window(8, 10, true, false, 48), vec![8, 9]);
+        assert_eq!(directional_window(2, 3, true, true, 48), vec![2, 0, 1]);
+        assert_eq!(directional_window(1, 3, false, true, 48), vec![1, 0, 2]);
     }
 }
