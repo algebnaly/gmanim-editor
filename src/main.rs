@@ -6,6 +6,7 @@ use interprocess::local_socket::{
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 pub mod ipc;
 use ipc::{
@@ -16,33 +17,14 @@ use ipc::{
 const PREVIEW_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const PREVIEW_CACHE_MIN_FRAMES: usize = PREVIEW_SLOT_COUNT as usize;
 const PREVIEW_CACHE_MAX_FRAMES: usize = 256;
-const PREVIEW_BUFFER_LOW_WATER: usize = 32;
 const PREVIEW_BUFFER_HIGH_WATER: usize = 48;
+const PREVIEW_BUFFER_RECOVERY_WATER: usize = 16;
 const PREVIEW_COMPLETIONS_PER_UI_UPDATE: usize = 4;
-
-fn producer_state(active: bool, buffered: usize, low_water: usize, high_water: usize) -> bool {
-    if active {
-        buffered < high_water
-    } else {
-        buffered < low_water
-    }
-}
-
-fn buffered_producer_state(
-    active: bool,
-    primed: bool,
-    buffered: usize,
-    low_water: usize,
-    high_water: usize,
-) -> (bool, bool) {
-    let primed = primed || buffered >= high_water;
-    let active = if primed {
-        buffered < high_water
-    } else {
-        producer_state(active, buffered, low_water, high_water)
-    };
-    (active, primed)
-}
+const PREVIEW_STEADY_IN_FLIGHT_MIN: usize = 2;
+const PREVIEW_STEADY_IN_FLIGHT_MAX: usize = 8;
+const PREVIEW_RTT_HEADROOM: f32 = 1.3;
+const PREVIEW_RTT_DEFAULT_SECS: f32 = 0.03;
+const PREVIEW_MAX_TICK_DT_SECS: f32 = 0.1;
 
 fn advance_playback_time(
     current_time: f32,
@@ -107,41 +89,38 @@ fn directional_window(
     frames
 }
 
-struct RateMeter {
-    window_started: std::time::Instant,
-    samples: u32,
-    rate: f32,
+fn steady_in_flight_cap(scene_fps: u32, rtt_secs: f32) -> usize {
+    let rate = scene_fps.max(1) as f32;
+    ((rate * rtt_secs.max(0.0) * PREVIEW_RTT_HEADROOM).ceil() as usize)
+        .clamp(PREVIEW_STEADY_IN_FLIGHT_MIN, PREVIEW_STEADY_IN_FLIGHT_MAX)
 }
 
-impl RateMeter {
-    fn new() -> Self {
-        Self {
-            window_started: std::time::Instant::now(),
-            samples: 0,
-            rate: 0.0,
-        }
-    }
+/// Direction-aware eviction context. Frames within `horizon` of the playhead
+/// in playback order belong to the prefetch window and must never be evicted,
+/// no matter how long ago they were last touched. The steady-state in-flight
+/// cap is deliberately shallow, so a plain LRU would otherwise keep evicting
+/// the very next frame to be displayed.
+#[derive(Clone, Copy, Debug)]
+struct EvictionContext {
+    playhead: u32,
+    total_frames: u32,
+    forward: bool,
+    horizon: u32,
+}
 
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    fn sample(&mut self) {
-        self.samples += 1;
-        let elapsed = self.window_started.elapsed();
-        if elapsed >= std::time::Duration::from_millis(500) {
-            self.rate = self.samples as f32 / elapsed.as_secs_f32();
-            self.window_started = std::time::Instant::now();
-            self.samples = 0;
-        }
-    }
-
-    fn rate(&self) -> f32 {
-        if self.samples == 0 && self.window_started.elapsed() >= std::time::Duration::from_secs(1) {
-            0.0
+/// Distance from the playhead to `frame` in playback order, wrapping around
+/// the loop boundary.
+fn forward_distance(frame: u32, playhead: u32, total_frames: u32, forward: bool) -> u32 {
+    if forward {
+        if frame >= playhead {
+            frame - playhead
         } else {
-            self.rate
+            total_frames - (playhead - frame)
         }
+    } else if playhead >= frame {
+        playhead - frame
+    } else {
+        total_frames - (frame - playhead)
     }
 }
 
@@ -164,12 +143,9 @@ impl PreviewFrameCache {
         self.frames.contains_key(&frame)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.frames.len()
-    }
-
-    fn capacity(&self) -> usize {
-        self.capacity
     }
 
     fn closest_not_after(&self, frame: u32) -> Option<u32> {
@@ -217,15 +193,51 @@ impl PreviewFrameCache {
         }
     }
 
-    fn insert(&mut self, frame: u32, image: std::sync::Arc<egui::ColorImage>) {
+    fn insert(
+        &mut self,
+        frame: u32,
+        image: std::sync::Arc<egui::ColorImage>,
+        eviction: EvictionContext,
+    ) {
         if self.frames.insert(frame, image).is_none() {
             self.lru.push_back(frame);
         }
         self.touch(frame);
         while self.frames.len() > self.capacity {
-            if let Some(evicted) = self.lru.pop_front() {
-                self.frames.remove(&evicted);
-            }
+            let candidate = if eviction.total_frames > 0 {
+                // Oldest frame outside the protected window...
+                self.lru
+                    .iter()
+                    .copied()
+                    .find(|cached| {
+                        forward_distance(
+                            *cached,
+                            eviction.playhead,
+                            eviction.total_frames,
+                            eviction.forward,
+                        ) >= eviction.horizon
+                    })
+                    // ...or, when everything is protected (tiny scene or a
+                    // cache smaller than the window), the frame furthest from
+                    // the playhead.
+                    .or_else(|| {
+                        self.lru.iter().copied().max_by_key(|cached| {
+                            forward_distance(
+                                *cached,
+                                eviction.playhead,
+                                eviction.total_frames,
+                                eviction.forward,
+                            )
+                        })
+                    })
+            } else {
+                self.lru.front().copied()
+            };
+            let Some(evicted) = candidate else {
+                break;
+            };
+            self.lru.retain(|cached| *cached != evicted);
+            self.frames.remove(&evicted);
         }
     }
 
@@ -248,6 +260,7 @@ struct PreviewRequest {
     id: u64,
     frame: u32,
     slot: u32,
+    created_at: Instant,
 }
 
 #[derive(Clone)]
@@ -274,25 +287,26 @@ fn read_preview_image(
     let height = layout.height as usize;
     let packed_stride = width * 4;
     let source = unsafe { shmem.as_ptr().add(layout.frame_offset(u64::from(slot))) };
-    let opaque = (0..height).all(|row| {
-        let source_row = unsafe {
-            std::slice::from_raw_parts(source.add(row * layout.stride as usize), packed_stride)
-        };
-        source_row.chunks_exact(4).all(|pixel| pixel[3] == 255)
-    });
+    debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
     let mut pixels = vec![egui::Color32::TRANSPARENT; width * height];
-    if opaque {
-        debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
-        for row in 0..height {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    source.add(row * layout.stride as usize),
-                    pixels.as_mut_ptr().cast::<u8>().add(row * packed_stride),
-                    packed_stride,
-                );
+    // Copy each row and scan the still cache-hot destination for transparency
+    // in the same pass, so opaque frames read shared memory only once.
+    let mut opaque = true;
+    for row in 0..height {
+        unsafe {
+            let dst = pixels.as_mut_ptr().cast::<u8>().add(row * packed_stride);
+            std::ptr::copy_nonoverlapping(
+                source.add(row * layout.stride as usize),
+                dst,
+                packed_stride,
+            );
+            let copied_row = std::slice::from_raw_parts(dst, packed_stride);
+            if copied_row.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+                opaque = false;
             }
         }
-    } else {
+    }
+    if !opaque {
         for row in 0..height {
             let source_row = unsafe {
                 std::slice::from_raw_parts(source.add(row * layout.stride as usize), packed_stride)
@@ -364,7 +378,6 @@ struct GmanimEditorApp {
     free_preview_slots: VecDeque<u32>,
     next_request_id: u64,
     prefetch_queue: VecDeque<u32>,
-    producer_active: bool,
     preview_buffer_primed: bool,
     render_failed: bool,
     total_frames_to_render: u32,
@@ -380,11 +393,18 @@ struct GmanimEditorApp {
     file_changed_rx: std::sync::mpsc::Receiver<()>,
     pending_file_reload: Option<std::time::Instant>,
     time_scale: f32,
-    render_rate: RateMeter,
-    display_rate: RateMeter,
-    skipped_timeline_frames: u64,
     is_looping: bool,
     show_editor: bool,
+
+    // Display clock: playback repaints follow a fixed cadence derived from the
+    // scene framerate, not runner completion events.
+    last_tick_at: Option<Instant>,
+    next_tick_deadline: Option<Instant>,
+    shared_is_playing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // Production scheduling: a shallow steady-state pipeline sized from RTT.
+    rtt_ewma_secs: f32,
+    last_buffered: usize,
 }
 
 impl GmanimEditorApp {
@@ -491,7 +511,6 @@ impl GmanimEditorApp {
             free_preview_slots: (0..PREVIEW_SLOT_COUNT).collect(),
             next_request_id: 1,
             prefetch_queue: VecDeque::new(),
-            producer_active: false,
             preview_buffer_primed: false,
             render_failed: false,
             total_frames_to_render: 0,
@@ -506,11 +525,15 @@ impl GmanimEditorApp {
             file_changed_rx: rx,
             pending_file_reload: None,
             time_scale: 1.0,
-            render_rate: RateMeter::new(),
-            display_rate: RateMeter::new(),
-            skipped_timeline_frames: 0,
             is_looping: true,
             show_editor: true,
+
+            last_tick_at: None,
+            next_tick_deadline: None,
+            shared_is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+
+            rtt_ewma_secs: PREVIEW_RTT_DEFAULT_SECS,
+            last_buffered: 0,
         };
 
         if app.has_project {
@@ -522,6 +545,26 @@ impl GmanimEditorApp {
 
     fn seek_to(&mut self, target_time: f32) {
         self.current_time = target_time;
+    }
+
+    fn reset_preview_scheduling(&mut self) {
+        self.last_tick_at = None;
+        self.next_tick_deadline = None;
+        self.rtt_ewma_secs = PREVIEW_RTT_DEFAULT_SECS;
+        self.last_buffered = 0;
+    }
+
+    fn in_flight_cap(&self) -> usize {
+        if !self.is_playing
+            || !self.preview_buffer_primed
+            || self.last_buffered < PREVIEW_BUFFER_RECOVERY_WATER
+        {
+            // Warm-up, seeks while paused, and underrun recovery may use the
+            // full slot depth; steady-state playback stays shallow.
+            PREVIEW_SLOT_COUNT as usize
+        } else {
+            steady_in_flight_cap(self.preview_framerate, self.rtt_ewma_secs)
+        }
     }
 
     fn run_python(&mut self, ctx: &egui::Context) {
@@ -656,19 +699,17 @@ impl GmanimEditorApp {
         self.in_flight_requests.clear();
         self.free_preview_slots = (0..PREVIEW_SLOT_COUNT).collect();
         self.prefetch_queue.clear();
-        self.producer_active = false;
         self.preview_buffer_primed = false;
-        self.render_rate.reset();
-        self.display_rate.reset();
-        self.skipped_timeline_frames = 0;
         self.render_failed = false;
         self.total_frames_to_render = 0;
+        self.reset_preview_scheduling();
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<EditorCommand>();
         self.ipc_tx_cmd = Some(cmd_tx);
 
         let ctx_clone = ctx.clone();
         let preview_readback_config = self.preview_readback_config.clone();
+        let shared_is_playing = self.shared_is_playing.clone();
 
         let tx_listen = tx.clone();
         let keep_running_listen = self.keep_running.clone();
@@ -699,6 +740,7 @@ impl GmanimEditorApp {
             let tx_clone = tx_listen.clone();
             let ctx_clone_read = ctx_clone.clone();
             let keep_running_read = keep_running_listen.clone();
+            let shared_is_playing_read = shared_is_playing.clone();
             let _handle2 = std::thread::spawn(move || {
                 let mut line = String::new();
                 let mut preview_readback: Option<(String, shared_memory::Shmem, PreviewLayout)> =
@@ -708,6 +750,10 @@ impl GmanimEditorApp {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
                             if let Ok(event) = serde_json::from_str::<EditorEvent>(&line) {
+                                // While playing, frame completions must not drive the
+                                // repaint rhythm; the UI follows its own display clock.
+                                let is_frame_ready =
+                                    matches!(event, EditorEvent::FrameReady { .. });
                                 match event {
                                     EditorEvent::ScenesInfo { scenes } => {
                                         let _ = tx_clone.send(ThreadMessage::ScenesInfo(scenes));
@@ -776,7 +822,11 @@ impl GmanimEditorApp {
                                         let _ = tx_clone.send(ThreadMessage::Error(message));
                                     }
                                 }
-                                ctx_clone_read.request_repaint();
+                                if !is_frame_ready
+                                    || !shared_is_playing_read.load(Ordering::Relaxed)
+                                {
+                                    ctx_clone_read.request_repaint();
+                                }
                             }
                             line.clear();
                         }
@@ -858,9 +908,9 @@ impl GmanimEditorApp {
         self.in_flight_requests.clear();
         self.free_preview_slots = (0..PREVIEW_SLOT_COUNT).collect();
         self.prefetch_queue.clear();
-        self.producer_active = false;
         self.preview_buffer_primed = false;
         self.render_failed = false;
+        self.reset_preview_scheduling();
         self.execution_result = "Preparing preview...".to_owned();
 
         self.ipc_tx_cmd
@@ -880,32 +930,35 @@ impl GmanimEditorApp {
         slot: u32,
         image: std::sync::Arc<egui::ColorImage>,
     ) -> Result<(), String> {
-        self.in_flight_requests
+        let request = self
+            .in_flight_requests
             .get(&request_id)
             .copied()
             .filter(|request| request.frame == frame && request.slot == slot)
             .ok_or_else(|| "preview completion does not match the in-flight request".to_owned())?;
+        let rtt_secs = Instant::now()
+            .checked_duration_since(request.created_at)
+            .unwrap_or_default()
+            .as_secs_f32();
+        self.rtt_ewma_secs = 0.9 * self.rtt_ewma_secs + 0.1 * rtt_secs;
+        let eviction = EvictionContext {
+            playhead: self.desired_frame,
+            total_frames: self.total_frames_to_render,
+            forward: self.time_scale >= 0.0,
+            horizon: PREVIEW_BUFFER_HIGH_WATER as u32,
+        };
         self.preview_cache
             .as_mut()
             .ok_or_else(|| "preview cache is unavailable".to_owned())?
-            .insert(frame, image);
-        self.render_rate.sample();
+            .insert(frame, image, eviction);
         self.in_flight_requests.remove(&request_id);
         self.free_preview_slots.push_back(slot);
-        self.execution_result = format!("Frame {frame} ready");
         Ok(())
     }
 
     fn set_preview_target(&mut self, frame: u32) {
         let frame = frame.min(self.total_frames_to_render.saturating_sub(1));
         if frame != self.desired_frame {
-            let crossed_loop_boundary = self.is_looping
-                && ((self.time_scale > 0.0 && frame < self.desired_frame)
-                    || (self.time_scale < 0.0 && frame > self.desired_frame));
-            if self.is_playing && !crossed_loop_boundary {
-                self.skipped_timeline_frames +=
-                    u64::from(frame.abs_diff(self.desired_frame).saturating_sub(1));
-            }
             self.desired_frame = frame;
         }
         self.refill_preview_buffer();
@@ -933,9 +986,8 @@ impl GmanimEditorApp {
             .collect();
 
         if !self.is_playing {
-            self.producer_active = false;
             self.prefetch_queue.clear();
-            for distance in 0..=PREVIEW_BUFFER_LOW_WATER {
+            for distance in 0..=PREVIEW_BUFFER_RECOVERY_WATER {
                 for candidate in [
                     self.desired_frame.checked_add(distance as u32),
                     self.desired_frame.checked_sub(distance as u32),
@@ -961,52 +1013,26 @@ impl GmanimEditorApp {
             .take_while(|frame| cache.contains(**frame) || in_flight_frames.contains(*frame))
             .count();
         let effective_high_water = window.len();
-        let effective_low_water = PREVIEW_BUFFER_LOW_WATER.min(effective_high_water);
-        let was_active = self.producer_active;
-        (self.producer_active, self.preview_buffer_primed) = buffered_producer_state(
-            self.producer_active,
-            self.preview_buffer_primed,
-            buffered,
-            effective_low_water,
-            effective_high_water,
-        );
-        if was_active && !self.producer_active && !self.preview_buffer_primed {
-            self.prefetch_queue.clear();
-            return;
+        self.last_buffered = buffered;
+        if buffered >= effective_high_water {
+            self.preview_buffer_primed = true;
         }
 
         self.prefetch_queue = window
             .into_iter()
-            .filter(|frame| {
-                !cache.contains(*frame)
-                    && !in_flight_frames.contains(frame)
-                    && (self.producer_active || *frame == self.desired_frame)
-            })
+            .filter(|frame| !cache.contains(*frame) && !in_flight_frames.contains(frame))
             .collect();
-    }
-
-    fn preview_buffer_status(&self) -> (usize, usize) {
-        let Some(cache) = self.preview_cache.as_ref() else {
-            return (0, 0);
-        };
-        let in_flight_frames: HashSet<u32> = self
-            .in_flight_requests
-            .values()
-            .map(|request| request.frame)
-            .collect();
-        let window = self.playback_window(PREVIEW_BUFFER_HIGH_WATER);
-        let buffered = window
-            .iter()
-            .take_while(|frame| cache.contains(**frame) || in_flight_frames.contains(*frame))
-            .count();
-        (buffered, window.len())
     }
 
     fn dispatch_preview_requests(&mut self) {
         if !self.preview_ready || self.total_frames_to_render == 0 {
             return;
         }
-        while let Some(slot) = self.free_preview_slots.pop_front() {
+        let cap = self.in_flight_cap();
+        while self.in_flight_requests.len() < cap {
+            let Some(slot) = self.free_preview_slots.pop_front() else {
+                break;
+            };
             let Some(frame) = self.prefetch_queue.pop_front() else {
                 self.free_preview_slots.push_front(slot);
                 break;
@@ -1025,6 +1051,7 @@ impl GmanimEditorApp {
             }
             let request_id = self.next_request_id;
             self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+            let created_at = Instant::now();
             let Some(tx) = &self.ipc_tx_cmd else {
                 self.free_preview_slots.push_front(slot);
                 return;
@@ -1046,6 +1073,7 @@ impl GmanimEditorApp {
                     id: request_id,
                     frame,
                     slot,
+                    created_at,
                 },
             );
         }
@@ -1169,8 +1197,9 @@ impl eframe::App for GmanimEditorApp {
                         self.render_failed = true;
                         self.execution_result = format!("Error: {error}");
                     }
+                    // Freeing the slot here keeps the shallow steady-state
+                    // pipeline full without extra repaint wakeups.
                     self.set_preview_target(self.desired_frame);
-                    ctx.request_repaint();
                 }
                 ThreadMessage::Error(msg) => {
                     self.render_failed = true;
@@ -1356,73 +1385,40 @@ impl eframe::App for GmanimEditorApp {
             ui.heading("Preview");
             ui.separator();
 
-            let status_height = 24.0;
-            let (buffered_frames, buffer_target) = self.preview_buffer_status();
-            let (cache_len, cache_capacity) = self
-                .preview_cache
-                .as_ref()
-                .map(|cache| (cache.len(), cache.capacity()))
-                .unwrap_or_default();
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), status_height),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    if let Some(request) = self.in_flight_requests.values().next() {
-                        ui.spinner();
-                        ui.label(format!(
-                            "Rendering {} frames (next {})",
-                            self.in_flight_requests.len(),
-                            request.frame
-                        ));
-                    } else if self.preview_ready {
-                        ui.label("Ready");
-                    } else {
-                        ui.label("Preparing preview");
-                    }
-                    ui.separator();
-                    ui.label(format!(
-                        "Scene {} | Display {:.1} | Render {:.1} FPS | Buffer {}/{} | Cache {}/{} | {} | {:.2}x | skipped {}",
-                        self.preview_framerate,
-                        self.display_rate.rate(),
-                        self.render_rate.rate(),
-                        buffered_frames,
-                        buffer_target,
-                        cache_len,
-                        cache_capacity,
-                        if self.producer_active {
-                            if self.preview_buffer_primed { "maintaining" } else { "filling" }
-                        } else {
-                            "idle"
-                        },
-                        self.time_scale,
-                        self.skipped_timeline_frames
-                    ));
-                },
-            );
+            if !self.preview_buffer_primed && self.total_frames_to_render > 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Preparing preview");
+                });
+            }
 
             let available_size = ui.available_size();
             let width = available_size.x.max(1.0) as u32;
             let height = available_size.y.max(1.0) as u32;
 
-            let mut need_seek = None;
+            let now = Instant::now();
+            self.shared_is_playing
+                .store(self.is_playing, Ordering::Relaxed);
+
+            // Advance scene time from the monotonic clock, never from runner
+            // completion events.
             if self.is_playing && self.total_frames_to_render > 0 {
-                let dt = ui.input(|i| i.stable_dt);
-                let delta = dt * self.time_scale;
+                let dt = self
+                    .last_tick_at
+                    .map(|last| now.duration_since(last).as_secs_f32())
+                    .unwrap_or(0.0)
+                    .min(PREVIEW_MAX_TICK_DT_SECS);
                 let (new_time, keep_playing) = advance_playback_time(
                     self.current_time,
-                    delta,
+                    dt * self.time_scale,
                     self.total_frames_to_render,
                     self.preview_framerate,
                     self.is_looping,
                 );
                 self.is_playing = keep_playing;
-                need_seek = Some(new_time);
+                self.seek_to(new_time);
             }
-
-            if let Some(time) = need_seek {
-                self.seek_to(time);
-                ui.ctx().request_repaint();
-            }
+            self.last_tick_at = Some(now);
 
             let current_frame = ((self.current_time * self.preview_framerate as f32) as u32)
                 .min(self.total_frames_to_render.saturating_sub(1));
@@ -1458,10 +1454,28 @@ impl eframe::App for GmanimEditorApp {
                     ));
                 }
                 self.displayed_frame = Some(frame);
-                self.display_rate.sample();
             }
-            if frame_to_display.is_none() {
-                ui.ctx().request_repaint();
+
+            // Fixed display cadence: schedule the next repaint against the
+            // scene frame period, catching up without bursting when a tick
+            // arrives late.
+            if self.is_playing && self.total_frames_to_render > 0 {
+                let period =
+                    Duration::from_secs_f64(1.0 / f64::from(self.preview_framerate.max(1)));
+                let deadline = match self.next_tick_deadline {
+                    Some(previous) if now < previous + Duration::from_millis(100) => {
+                        let mut next = previous;
+                        while next <= now {
+                            next += period;
+                        }
+                        next
+                    }
+                    _ => now + period,
+                };
+                self.next_tick_deadline = Some(deadline);
+                ui.ctx().request_repaint_after(deadline.duration_since(now));
+            } else {
+                self.next_tick_deadline = None;
             }
 
             if let Some(tex) = &self.texture_handle {
@@ -1490,21 +1504,36 @@ impl eframe::App for GmanimEditorApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        PreviewFrameCache, advance_playback_time, buffered_producer_state, directional_window,
-        producer_state,
+        EvictionContext, PreviewFrameCache, advance_playback_time, directional_window,
+        forward_distance, steady_in_flight_cap,
     };
+
+    fn evict_ctx(playhead: u32, total_frames: u32, horizon: u32) -> EvictionContext {
+        EvictionContext {
+            playhead,
+            total_frames,
+            forward: true,
+            horizon,
+        }
+    }
+
+    fn test_image() -> std::sync::Arc<egui::ColorImage> {
+        std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [2, 1],
+            &[255, 0, 0, 255, 0, 255, 0, 128],
+        ))
+    }
 
     #[test]
     fn preview_cache_evicts_the_least_recently_used_frame() {
         let mut cache = PreviewFrameCache::new(2);
-        let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-            [2, 1],
-            &[255, 0, 0, 255, 0, 255, 0, 128],
-        ));
-        cache.insert(1, image.clone());
-        cache.insert(2, image.clone());
+        // Frame 1 is inside the protected window (distance 1 < horizon 2),
+        // frames 2 and 3 are outside; the oldest outside frame is evicted.
+        let ctx = evict_ctx(0, 1200, 2);
+        cache.insert(1, test_image(), ctx);
+        cache.insert(2, test_image(), ctx);
         cache.load_image(1).unwrap();
-        cache.insert(3, image);
+        cache.insert(3, test_image(), ctx);
 
         assert!(cache.contains(1));
         assert!(!cache.contains(2));
@@ -1516,27 +1545,72 @@ mod tests {
     }
 
     #[test]
-    fn producer_uses_low_and_high_water_hysteresis() {
-        assert!(!producer_state(false, 32, 32, 48));
-        assert!(producer_state(false, 31, 32, 48));
-        assert!(producer_state(true, 47, 32, 48));
-        assert!(!producer_state(true, 48, 32, 48));
+    fn cache_never_evicts_upcoming_window_frames() {
+        // Steady state with a shallow in-flight queue: after warm-up each tick
+        // displays the playhead frame and inserts the completion at the window
+        // tail. A plain LRU would evict the next frame to be displayed on
+        // every tick.
+        let mut cache = PreviewFrameCache::new(8);
+        let warm_up = evict_ctx(0, 100, 4);
+        for frame in 0..4u32 {
+            cache.insert(frame, test_image(), warm_up);
+        }
+        for playhead in 1..40u32 {
+            let ctx = evict_ctx(playhead, 100, 4);
+            cache.load_image(playhead);
+            cache.insert(playhead + 3, test_image(), ctx);
+            assert!(
+                cache.contains(playhead + 1),
+                "next display frame {} was evicted at playhead {}",
+                playhead + 1,
+                playhead
+            );
+            assert!(cache.len() <= 8);
+        }
     }
 
     #[test]
-    fn primed_buffer_is_maintained_without_waiting_for_low_water() {
-        assert_eq!(
-            buffered_producer_state(true, false, 48, 32, 48),
-            (false, true)
-        );
-        assert_eq!(
-            buffered_producer_state(false, true, 47, 32, 48),
-            (true, true)
-        );
-        assert_eq!(
-            buffered_producer_state(true, true, 48, 32, 48),
-            (false, true)
-        );
+    fn cache_protects_prerendered_frames_across_a_loop_wrap() {
+        // During the last ticks before a wrap the window already covers the
+        // first frames of the next loop; they must survive until the playhead
+        // crosses the boundary.
+        let mut cache = PreviewFrameCache::new(8);
+        for playhead in 0..10u32 {
+            let ctx = evict_ctx(playhead, 10, 4);
+            cache.load_image(playhead);
+            cache.insert((playhead + 3) % 10, test_image(), ctx);
+        }
+        assert!(cache.contains(0));
+        assert!(cache.contains(1));
+        // Wrapped playhead: stale frames behind the boundary are evictable,
+        // the pre-rendered head of the next loop stays.
+        let ctx = evict_ctx(0, 10, 4);
+        cache.load_image(0);
+        cache.insert(3, test_image(), ctx);
+        assert!(cache.contains(0));
+        assert!(cache.contains(1));
+        assert!(!cache.contains(5));
+    }
+
+    #[test]
+    fn cache_falls_back_to_furthest_frame_when_all_protected() {
+        let mut cache = PreviewFrameCache::new(3);
+        let ctx = evict_ctx(0, 1200, 48);
+        cache.insert(1, test_image(), ctx);
+        cache.insert(2, test_image(), ctx);
+        cache.insert(3, test_image(), ctx);
+        cache.insert(4, test_image(), ctx);
+        assert!(cache.contains(1));
+        assert!(!cache.contains(4));
+    }
+
+    #[test]
+    fn forward_distance_wraps_in_playback_direction() {
+        assert_eq!(forward_distance(5, 3, 1200, true), 2);
+        assert_eq!(forward_distance(1, 1199, 1200, true), 2);
+        assert_eq!(forward_distance(1199, 1, 1200, false), 2);
+        assert_eq!(forward_distance(3, 5, 1200, false), 2);
+        assert_eq!(forward_distance(7, 7, 1200, true), 0);
     }
 
     #[test]
@@ -1558,6 +1632,7 @@ mod tests {
     #[test]
     fn playback_selection_never_regresses_outside_a_loop_boundary() {
         let mut cache = PreviewFrameCache::new(8);
+        let ctx = evict_ctx(0, 1200, 48);
         for frame in [84, 100, 103, 1199, 0] {
             cache.insert(
                 frame,
@@ -1565,6 +1640,7 @@ mod tests {
                     [1, 1],
                     &[0, 0, 0, 255],
                 )),
+                ctx,
             );
         }
 
@@ -1578,5 +1654,12 @@ mod tests {
         assert_eq!(directional_window(8, 10, true, false, 48), vec![8, 9]);
         assert_eq!(directional_window(2, 3, true, true, 48), vec![2, 0, 1]);
         assert_eq!(directional_window(1, 3, false, true, 48), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn steady_in_flight_cap_scales_with_rtt() {
+        assert_eq!(steady_in_flight_cap(120, 0.03), 5);
+        assert_eq!(steady_in_flight_cap(120, 0.0), 2);
+        assert_eq!(steady_in_flight_cap(120, 1.0), 8);
     }
 }
