@@ -8,11 +8,21 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+pub mod cache;
 pub mod ipc;
+pub mod playback;
+pub mod syntax;
+pub mod tests;
+
+use cache::{EvictionContext, PreviewFrameCache};
 use ipc::{
     EditorCommand, EditorEvent, PREVIEW_SLOT_COUNT, PreviewLayout, PreviewPixelFormat,
     PreviewShmHeader, ThreadMessage,
 };
+use playback::{
+    advance_playback_time, clamp_playback_time, directional_window,
+};
+use syntax::Highlighter;
 
 const PREVIEW_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const PREVIEW_CACHE_MIN_FRAMES: usize = PREVIEW_SLOT_COUNT as usize;
@@ -26,234 +36,12 @@ const PREVIEW_RTT_HEADROOM: f32 = 1.3;
 const PREVIEW_RTT_DEFAULT_SECS: f32 = 0.03;
 const PREVIEW_MAX_TICK_DT_SECS: f32 = 0.1;
 
-fn advance_playback_time(
-    current_time: f32,
-    delta: f32,
-    total_frames: u32,
-    framerate: u32,
-    looping: bool,
-) -> (f32, bool) {
-    if total_frames == 0 || framerate == 0 {
-        return (current_time, true);
-    }
-    let next_time = current_time + delta;
-    if looping {
-        let duration = total_frames as f32 / framerate as f32;
-        return (next_time.rem_euclid(duration), true);
-    }
-    let last_frame_time = total_frames.saturating_sub(1) as f32 / framerate as f32;
-    if next_time >= last_frame_time {
-        (last_frame_time, false)
-    } else if next_time <= 0.0 {
-        (0.0, false)
-    } else {
-        (next_time, true)
-    }
-}
-
-fn directional_window(
-    desired: u32,
-    total_frames: u32,
-    forward: bool,
-    looping: bool,
-    limit: usize,
-) -> Vec<u32> {
-    if total_frames == 0 {
-        return Vec::new();
-    }
-    let mut frames = Vec::with_capacity(limit.min(total_frames as usize));
-    let mut seen = HashSet::with_capacity(limit.min(total_frames as usize));
-    for offset in 0..limit as u32 {
-        let frame = if forward {
-            match desired.checked_add(offset) {
-                Some(frame) if frame < total_frames => Some(frame),
-                Some(frame) if looping => Some(frame % total_frames),
-                _ => None,
-            }
-        } else if offset <= desired {
-            Some(desired - offset)
-        } else if looping {
-            let wrapped = (offset - desired) % total_frames;
-            Some((total_frames - wrapped) % total_frames)
-        } else {
-            None
-        };
-        let Some(frame) = frame else {
-            break;
-        };
-        if !seen.insert(frame) {
-            break;
-        }
-        frames.push(frame);
-    }
-    frames
-}
-
 fn steady_in_flight_cap(scene_fps: u32, rtt_secs: f32) -> usize {
     let rate = scene_fps.max(1) as f32;
     ((rate * rtt_secs.max(0.0) * PREVIEW_RTT_HEADROOM).ceil() as usize)
         .clamp(PREVIEW_STEADY_IN_FLIGHT_MIN, PREVIEW_STEADY_IN_FLIGHT_MAX)
 }
 
-/// Direction-aware eviction context. Frames within `horizon` of the playhead
-/// in playback order belong to the prefetch window and must never be evicted,
-/// no matter how long ago they were last touched. The steady-state in-flight
-/// cap is deliberately shallow, so a plain LRU would otherwise keep evicting
-/// the very next frame to be displayed.
-#[derive(Clone, Copy, Debug)]
-struct EvictionContext {
-    playhead: u32,
-    total_frames: u32,
-    forward: bool,
-    horizon: u32,
-}
-
-/// Distance from the playhead to `frame` in playback order, wrapping around
-/// the loop boundary.
-fn forward_distance(frame: u32, playhead: u32, total_frames: u32, forward: bool) -> u32 {
-    if forward {
-        if frame >= playhead {
-            frame - playhead
-        } else {
-            total_frames - (playhead - frame)
-        }
-    } else if playhead >= frame {
-        playhead - frame
-    } else {
-        total_frames - (frame - playhead)
-    }
-}
-
-struct PreviewFrameCache {
-    frames: HashMap<u32, std::sync::Arc<egui::ColorImage>>,
-    lru: VecDeque<u32>,
-    capacity: usize,
-}
-
-impl PreviewFrameCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            frames: HashMap::new(),
-            lru: VecDeque::new(),
-            capacity,
-        }
-    }
-
-    fn contains(&self, frame: u32) -> bool {
-        self.frames.contains_key(&frame)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.frames.len()
-    }
-
-    fn closest_not_after(&self, frame: u32) -> Option<u32> {
-        self.frames
-            .keys()
-            .copied()
-            .filter(|cached| *cached <= frame)
-            .max()
-    }
-
-    fn closest_not_before(&self, frame: u32) -> Option<u32> {
-        self.frames
-            .keys()
-            .copied()
-            .filter(|cached| *cached >= frame)
-            .min()
-    }
-
-    fn playback_frame(
-        &self,
-        desired: u32,
-        displayed: Option<u32>,
-        forward: bool,
-        looping: bool,
-    ) -> Option<u32> {
-        let candidate = if forward {
-            self.closest_not_after(desired)
-        } else {
-            self.closest_not_before(desired)
-        }?;
-        let Some(displayed) = displayed else {
-            return Some(candidate);
-        };
-        let crossed_loop_boundary =
-            looping && ((forward && desired < displayed) || (!forward && desired > displayed));
-        if crossed_loop_boundary
-            || (forward && candidate >= displayed)
-            || (!forward && candidate <= displayed)
-        {
-            Some(candidate)
-        } else if self.contains(displayed) {
-            Some(displayed)
-        } else {
-            None
-        }
-    }
-
-    fn insert(
-        &mut self,
-        frame: u32,
-        image: std::sync::Arc<egui::ColorImage>,
-        eviction: EvictionContext,
-    ) {
-        if self.frames.insert(frame, image).is_none() {
-            self.lru.push_back(frame);
-        }
-        self.touch(frame);
-        while self.frames.len() > self.capacity {
-            let candidate = if eviction.total_frames > 0 {
-                // Oldest frame outside the protected window...
-                self.lru
-                    .iter()
-                    .copied()
-                    .find(|cached| {
-                        forward_distance(
-                            *cached,
-                            eviction.playhead,
-                            eviction.total_frames,
-                            eviction.forward,
-                        ) >= eviction.horizon
-                    })
-                    // ...or, when everything is protected (tiny scene or a
-                    // cache smaller than the window), the frame furthest from
-                    // the playhead.
-                    .or_else(|| {
-                        self.lru.iter().copied().max_by_key(|cached| {
-                            forward_distance(
-                                *cached,
-                                eviction.playhead,
-                                eviction.total_frames,
-                                eviction.forward,
-                            )
-                        })
-                    })
-            } else {
-                self.lru.front().copied()
-            };
-            let Some(evicted) = candidate else {
-                break;
-            };
-            self.lru.retain(|cached| *cached != evicted);
-            self.frames.remove(&evicted);
-        }
-    }
-
-    fn load_image(&mut self, frame: u32) -> Option<std::sync::Arc<egui::ColorImage>> {
-        if !self.frames.contains_key(&frame) {
-            return None;
-        }
-        self.touch(frame);
-        self.frames.get(&frame).cloned()
-    }
-
-    fn touch(&mut self, frame: u32) {
-        self.lru.retain(|cached| *cached != frame);
-        self.lru.push_back(frame);
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreviewRequest {
@@ -268,6 +56,26 @@ struct PreviewReadbackConfig {
     shm_id: String,
     layout: PreviewLayout,
 }
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SceneId {
+    source: String,
+    name: String,
+}
+
+fn restored_playback_time(
+    positions: &HashMap<SceneId, f32>,
+    scene: &SceneId,
+    total_frames: u32,
+    framerate: u32,
+) -> f32 {
+    positions
+        .get(scene)
+        .copied()
+        .map(|time| clamp_playback_time(time, total_frames, framerate))
+        .unwrap_or(0.0)
+}
+
 
 fn read_preview_image(
     shmem: &shared_memory::Shmem,
@@ -392,6 +200,8 @@ struct GmanimEditorApp {
     _watcher: Option<notify::RecommendedWatcher>,
     file_changed_rx: std::sync::mpsc::Receiver<()>,
     pending_file_reload: Option<std::time::Instant>,
+    active_scene: Option<SceneId>,
+    scene_playback_positions: HashMap<SceneId, f32>,
     time_scale: f32,
     is_looping: bool,
     show_editor: bool,
@@ -405,6 +215,13 @@ struct GmanimEditorApp {
     // Production scheduling: a shallow steady-state pipeline sized from RTT.
     rtt_ewma_secs: f32,
     last_buffered: usize,
+
+    scale_mode: bool,
+    zoom_factor: f32,
+    pan_offset: egui::Vec2,
+
+    highlighter: Highlighter,
+    highlight_cache: Option<(String, f32, std::sync::Arc<egui::Galley>)>,
 }
 
 impl GmanimEditorApp {
@@ -524,9 +341,11 @@ impl GmanimEditorApp {
             _watcher: watcher,
             file_changed_rx: rx,
             pending_file_reload: None,
+            active_scene: None,
+            scene_playback_positions: HashMap::new(),
             time_scale: 1.0,
             is_looping: true,
-            show_editor: true,
+            show_editor: false,
 
             last_tick_at: None,
             next_tick_deadline: None,
@@ -534,6 +353,13 @@ impl GmanimEditorApp {
 
             rtt_ewma_secs: PREVIEW_RTT_DEFAULT_SECS,
             last_buffered: 0,
+            
+            scale_mode: false,
+            zoom_factor: 1.0,
+            pan_offset: egui::Vec2::ZERO,
+
+            highlighter: Highlighter::default(),
+            highlight_cache: None,
         };
 
         if app.has_project {
@@ -545,6 +371,13 @@ impl GmanimEditorApp {
 
     fn seek_to(&mut self, target_time: f32) {
         self.current_time = target_time;
+    }
+
+    fn remember_active_scene_position(&mut self) {
+        if let Some(scene) = self.active_scene.clone() {
+            self.scene_playback_positions
+                .insert(scene, self.current_time);
+        }
     }
 
     fn reset_preview_scheduling(&mut self) {
@@ -568,6 +401,8 @@ impl GmanimEditorApp {
     }
 
     fn run_python(&mut self, ctx: &egui::Context) {
+        self.remember_active_scene_position();
+        self.active_scene = None;
         if let Some(mut child) = self.subprocess.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -903,8 +738,19 @@ impl GmanimEditorApp {
         self.total_frames_to_render = total_frames;
         self.preview_framerate = framerate.max(1);
         self.preview_size = (width, height);
-        self.current_time = 0.0;
-        self.desired_frame = 0;
+        let scene = SceneId {
+            source: self.current_file.clone(),
+            name: self.selected_scene.clone(),
+        };
+        self.current_time = restored_playback_time(
+            &self.scene_playback_positions,
+            &scene,
+            total_frames,
+            self.preview_framerate,
+        );
+        self.active_scene = Some(scene);
+        self.desired_frame = ((self.current_time * self.preview_framerate as f32) as u32)
+            .min(total_frames.saturating_sub(1));
         self.in_flight_requests.clear();
         self.free_preview_slots = (0..PREVIEW_SLOT_COUNT).collect();
         self.prefetch_queue.clear();
@@ -919,7 +765,7 @@ impl GmanimEditorApp {
             .send(EditorCommand::OpenPreview { shm_id })
             .map_err(|_| "Python renderer stopped before opening the preview".to_owned())?;
         self.preview_ready = true;
-        self.set_preview_target(0);
+        self.set_preview_target(self.desired_frame);
         Ok(())
     }
 
@@ -1109,6 +955,39 @@ impl eframe::App for GmanimEditorApp {
 
         let ctx = &root_ui.ctx().clone();
 
+        // Keyboard shortcuts (only when not interacting with text fields)
+        if !ctx.egui_wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.is_playing = !self.is_playing;
+                if self.is_playing {
+                    let max_time = self.total_frames_to_render.saturating_sub(1) as f32 / self.preview_framerate.max(1) as f32;
+                    if self.current_time >= max_time {
+                        self.seek_to(0.0);
+                    }
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::S)) {
+                self.scale_mode = true;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.scale_mode = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+                self.zoom_factor = 1.0;
+                self.pan_offset = egui::Vec2::ZERO;
+            }
+
+            let seek_step = if ctx.input(|i| i.modifiers.shift) { 0.2 } else { 1.0 };
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                self.seek_to(clamp_playback_time(self.current_time + seek_step, self.total_frames_to_render, self.preview_framerate));
+                self.is_playing = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                self.seek_to(clamp_playback_time(self.current_time - seek_step, self.total_frames_to_render, self.preview_framerate));
+                self.is_playing = false;
+            }
+        }
+
         // Check file change
         if self.file_changed_rx.try_recv().is_ok() {
             while self.file_changed_rx.try_recv().is_ok() {}
@@ -1185,7 +1064,7 @@ impl eframe::App for GmanimEditorApp {
                 ThreadMessage::PreviewOpened => {
                     self.preview_ready = true;
                     self.execution_result = "Preview ready".to_owned();
-                    self.set_preview_target(0);
+                    self.set_preview_target(self.desired_frame);
                 }
                 ThreadMessage::FrameReady {
                     request_id,
@@ -1271,6 +1150,8 @@ impl eframe::App for GmanimEditorApp {
 
                 if self.selected_scene != previous_scene && !self.selected_scene.is_empty() {
                     // Start rendering new scene
+                    self.remember_active_scene_position();
+                    self.active_scene = None;
                     if let Some(tx) = &self.ipc_tx_cmd {
                         let _ = tx.send(EditorCommand::LoadScene {
                             name: self.selected_scene.clone(),
@@ -1290,12 +1171,28 @@ impl eframe::App for GmanimEditorApp {
                     ui.heading("Code");
                     ui.separator();
 
+                    let mut cache = self.highlight_cache.take();
+
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let text_str = text.as_str();
+                        if let Some((cached_text, cached_width, cached_galley)) = &cache {
+                            if cached_text == text_str && *cached_width == wrap_width {
+                                return cached_galley.clone();
+                            }
+                        }
+                        let layout_job = self.highlighter.highlight(text_str, wrap_width);
+                        let galley = ui.fonts_mut(|f| f.layout_job(layout_job));
+                        cache = Some((text_str.to_owned(), wrap_width, galley.clone()));
+                        galley
+                    };
+
                     let editor = egui::TextEdit::multiline(&mut self.python_script)
                         .font(egui::TextStyle::Monospace)
                         .code_editor()
                         .desired_rows(30)
                         .lock_focus(true)
-                        .desired_width(f32::INFINITY);
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter);
 
                     let mut changed = false;
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1303,6 +1200,8 @@ impl eframe::App for GmanimEditorApp {
                             changed = true;
                         }
                     });
+                    
+                    self.highlight_cache = cache;
 
                     if changed && self.has_project {
                         let _ = std::fs::write(&self.current_file, &self.python_script);
@@ -1381,17 +1280,7 @@ impl eframe::App for GmanimEditorApp {
         });
 
         // Right Panel (Preview)
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
-            ui.heading("Preview");
-            ui.separator();
-
-            if !self.preview_buffer_primed && self.total_frames_to_render > 0 {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Preparing preview");
-                });
-            }
-
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(root_ui, |ui| {
             let available_size = ui.available_size();
             let width = available_size.x.max(1.0) as u32;
             let height = available_size.y.max(1.0) as u32;
@@ -1487,12 +1376,49 @@ impl eframe::App for GmanimEditorApp {
                     display_height = height as f32;
                     display_width = height as f32 * aspect_ratio;
                 }
+                
+                let center = ui.available_rect_before_wrap().center();
+                let rect = egui::Rect::from_center_size(
+                    center + self.pan_offset,
+                    egui::vec2(display_width, display_height) * self.zoom_factor,
+                );
 
+                if self.scale_mode {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    if let Some(pointer_pos) = ui.ctx().pointer_hover_pos() {
+                        let scroll_delta = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+                        if scroll_delta != 0.0 {
+                            let old_zoom = self.zoom_factor;
+                            let zoom_delta = (scroll_delta * 0.005).exp();
+                            self.zoom_factor *= zoom_delta;
+                            self.zoom_factor = self.zoom_factor.clamp(0.1, 50.0);
+                            
+                            let mouse_vec = pointer_pos.to_vec2() - center.to_vec2() - self.pan_offset;
+                            let zoom_ratio = self.zoom_factor / old_zoom;
+                            self.pan_offset -= mouse_vec * (zoom_ratio - 1.0);
+                        }
+                    }
+                    
+                    if ui.ctx().input(|i| i.pointer.primary_down()) {
+                        self.pan_offset += ui.ctx().input(|i| i.pointer.delta());
+                    }
+                }
+
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+
+                if self.scale_mode {
+                    ui.painter().text(
+                        ui.available_rect_before_wrap().min + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("Scale Mode (Zoom: {:.1}x) - Esc to exit, 0 to reset", self.zoom_factor),
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::YELLOW,
+                    );
+                }
+            } else if self.total_frames_to_render > 0 {
                 ui.centered_and_justified(|ui| {
-                    ui.image(egui::load::SizedTexture::new(
-                        tex.id(),
-                        [display_width, display_height],
-                    ));
+                    ui.label("Preparing preview");
                 });
             } else {
                 ui.label("No scene loaded.");
@@ -1501,165 +1427,4 @@ impl eframe::App for GmanimEditorApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        EvictionContext, PreviewFrameCache, advance_playback_time, directional_window,
-        forward_distance, steady_in_flight_cap,
-    };
 
-    fn evict_ctx(playhead: u32, total_frames: u32, horizon: u32) -> EvictionContext {
-        EvictionContext {
-            playhead,
-            total_frames,
-            forward: true,
-            horizon,
-        }
-    }
-
-    fn test_image() -> std::sync::Arc<egui::ColorImage> {
-        std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-            [2, 1],
-            &[255, 0, 0, 255, 0, 255, 0, 128],
-        ))
-    }
-
-    #[test]
-    fn preview_cache_evicts_the_least_recently_used_frame() {
-        let mut cache = PreviewFrameCache::new(2);
-        // Frame 1 is inside the protected window (distance 1 < horizon 2),
-        // frames 2 and 3 are outside; the oldest outside frame is evicted.
-        let ctx = evict_ctx(0, 1200, 2);
-        cache.insert(1, test_image(), ctx);
-        cache.insert(2, test_image(), ctx);
-        cache.load_image(1).unwrap();
-        cache.insert(3, test_image(), ctx);
-
-        assert!(cache.contains(1));
-        assert!(!cache.contains(2));
-        assert!(cache.contains(3));
-        let image = cache.load_image(1).unwrap();
-        assert_eq!(image.size, [2, 1]);
-        assert_eq!(image.pixels[0].to_srgba_unmultiplied(), [255, 0, 0, 255]);
-        assert_eq!(image.pixels[1].to_srgba_unmultiplied(), [0, 255, 0, 128]);
-    }
-
-    #[test]
-    fn cache_never_evicts_upcoming_window_frames() {
-        // Steady state with a shallow in-flight queue: after warm-up each tick
-        // displays the playhead frame and inserts the completion at the window
-        // tail. A plain LRU would evict the next frame to be displayed on
-        // every tick.
-        let mut cache = PreviewFrameCache::new(8);
-        let warm_up = evict_ctx(0, 100, 4);
-        for frame in 0..4u32 {
-            cache.insert(frame, test_image(), warm_up);
-        }
-        for playhead in 1..40u32 {
-            let ctx = evict_ctx(playhead, 100, 4);
-            cache.load_image(playhead);
-            cache.insert(playhead + 3, test_image(), ctx);
-            assert!(
-                cache.contains(playhead + 1),
-                "next display frame {} was evicted at playhead {}",
-                playhead + 1,
-                playhead
-            );
-            assert!(cache.len() <= 8);
-        }
-    }
-
-    #[test]
-    fn cache_protects_prerendered_frames_across_a_loop_wrap() {
-        // During the last ticks before a wrap the window already covers the
-        // first frames of the next loop; they must survive until the playhead
-        // crosses the boundary.
-        let mut cache = PreviewFrameCache::new(8);
-        for playhead in 0..10u32 {
-            let ctx = evict_ctx(playhead, 10, 4);
-            cache.load_image(playhead);
-            cache.insert((playhead + 3) % 10, test_image(), ctx);
-        }
-        assert!(cache.contains(0));
-        assert!(cache.contains(1));
-        // Wrapped playhead: stale frames behind the boundary are evictable,
-        // the pre-rendered head of the next loop stays.
-        let ctx = evict_ctx(0, 10, 4);
-        cache.load_image(0);
-        cache.insert(3, test_image(), ctx);
-        assert!(cache.contains(0));
-        assert!(cache.contains(1));
-        assert!(!cache.contains(5));
-    }
-
-    #[test]
-    fn cache_falls_back_to_furthest_frame_when_all_protected() {
-        let mut cache = PreviewFrameCache::new(3);
-        let ctx = evict_ctx(0, 1200, 48);
-        cache.insert(1, test_image(), ctx);
-        cache.insert(2, test_image(), ctx);
-        cache.insert(3, test_image(), ctx);
-        cache.insert(4, test_image(), ctx);
-        assert!(cache.contains(1));
-        assert!(!cache.contains(4));
-    }
-
-    #[test]
-    fn forward_distance_wraps_in_playback_direction() {
-        assert_eq!(forward_distance(5, 3, 1200, true), 2);
-        assert_eq!(forward_distance(1, 1199, 1200, true), 2);
-        assert_eq!(forward_distance(1199, 1, 1200, false), 2);
-        assert_eq!(forward_distance(3, 5, 1200, false), 2);
-        assert_eq!(forward_distance(7, 7, 1200, true), 0);
-    }
-
-    #[test]
-    fn looping_preserves_forward_and_backward_overshoot() {
-        let (forward, playing) = advance_playback_time(9.99, 0.02, 1200, 120, true);
-        assert!(playing);
-        assert!((forward - 0.01).abs() < 1e-4);
-
-        let (backward, playing) = advance_playback_time(0.01, -0.02, 1200, 120, true);
-        assert!(playing);
-        assert!((backward - 9.99).abs() < 1e-4);
-    }
-
-    #[test]
-    fn missing_timeline_does_not_cancel_playback_intent() {
-        assert_eq!(advance_playback_time(0.0, 0.01, 0, 120, true), (0.0, true));
-    }
-
-    #[test]
-    fn playback_selection_never_regresses_outside_a_loop_boundary() {
-        let mut cache = PreviewFrameCache::new(8);
-        let ctx = evict_ctx(0, 1200, 48);
-        for frame in [84, 100, 103, 1199, 0] {
-            cache.insert(
-                frame,
-                std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                    [1, 1],
-                    &[0, 0, 0, 255],
-                )),
-                ctx,
-            );
-        }
-
-        assert_eq!(cache.playback_frame(102, Some(100), true, true), Some(100));
-        assert_eq!(cache.playback_frame(0, Some(1199), true, true), Some(0));
-        assert_eq!(cache.playback_frame(101, Some(103), false, true), Some(103));
-    }
-
-    #[test]
-    fn directional_window_uses_effective_end_and_deduplicates_short_loops() {
-        assert_eq!(directional_window(8, 10, true, false, 48), vec![8, 9]);
-        assert_eq!(directional_window(2, 3, true, true, 48), vec![2, 0, 1]);
-        assert_eq!(directional_window(1, 3, false, true, 48), vec![1, 0, 2]);
-    }
-
-    #[test]
-    fn steady_in_flight_cap_scales_with_rtt() {
-        assert_eq!(steady_in_flight_cap(120, 0.03), 5);
-        assert_eq!(steady_in_flight_cap(120, 0.0), 2);
-        assert_eq!(steady_in_flight_cap(120, 1.0), 8);
-    }
-}
